@@ -78,146 +78,196 @@ and the one thing worth backing up.
 the others do, and one of the others carries a setting that is actively
 dangerous here.
 
-`/etc/nginx/sites-available/pages.vps.sarvinshrivastava.space`:
+The box's conventions, which this follows: TLS comes from
+`include snippets/ssl-vps.conf;` (cert lineage `vps-subdomains`, no `ssl_dhparam`
+and no `options-ssl-nginx.conf`), ACME from
+`include snippets/acme-challenge.conf;` on port 80, webroot `/var/www/certbot`.
+nginx is 1.24, so it is `listen 443 ssl;` — the standalone `http2 on;` directive
+needs 1.25.1+.
 
-```nginx
-limit_req_zone $binary_remote_addr zone=pages:10m rate=10r/s;  # in http{} context
-
-server {
-  listen 443 ssl http2;
-  server_name pages.vps.sarvinshrivastava.space;
-  # certbot fills in ssl_certificate / ssl_certificate_key
-
-  # 1. The tool endpoint is NOT public. It is bearer-gated, but this container
-  #    has a hard memory ceiling and one shared vCPU, and there is no reason for
-  #    anything outside the Docker network to reach it at all.
-  location = /mcp     { return 404; }
-  location ^~ /mcp/   { return 404; }
-  location = /healthz { return 404; }
-
-  # 2. Almost everything here is GET-only and nothing accepts a body. Do NOT
-  #    inherit `client_max_body_size 200m` from the CodePush vhost — that hands
-  #    an attacker a 200 MB upload against a 384 MB container.
-  client_max_body_size 1k;
-  limit_req zone=pages burst=20 nodelay;
-
-  # The one exception: pressing "Publish it" on an approval link is a POST.
-  location ^~ /approve/ {
-    proxy_pass http://127.0.0.1:3013;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    limit_except GET HEAD POST { deny all; }
-    add_header Cache-Control "no-store, max-age=0" always;
-    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
-  }
-
-  location / {
-    limit_except GET HEAD { deny all; }
-    proxy_pass http://127.0.0.1:3013;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_read_timeout 30s;
-
-    # 3. NEVER cache. A page that is shared today can be made private tomorrow,
-    #    and a cached copy keeps serving it with nothing this service can do.
-    proxy_cache off;
-    proxy_no_cache 1;
-    proxy_cache_bypass 1;
-
-    # The app sets two of these itself; hide the upstream copy first or the
-    # browser receives the header twice and behaviour diverges by browser.
-    proxy_hide_header X-Frame-Options;
-    proxy_hide_header Referrer-Policy;
-
-    add_header Cache-Control "no-store, max-age=0" always;
-    # Belt and braces with the app's own header and /robots.txt. Nothing on this
-    # host is meant to be findable in a search engine — "public" means anyone
-    # with the link can open it, not that it can be found.
-    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
-    add_header X-Content-Type-Options nosniff always;
-    add_header Referrer-Policy no-referrer always;
-    add_header X-Frame-Options DENY always;
-    add_header Content-Security-Policy
-      "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src data:; connect-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'" always;
-
-    gzip on;
-    gzip_types text/html;
-    gzip_min_length 1024;
-  }
-}
-```
-
-### Bringing it up — two phases, and the order matters
-
-nginx will not load a `listen 443 ssl` block before a certificate for that name
-exists, so the config above cannot be the first thing on disk. All of this runs
-**on the VPS**, as root.
-
-**Phase 1 — a port-80 stub, so certbot has something to validate against.**
+### 1. A port-80 stub, so the new name can be validated
 
 ```bash
 cat > /etc/nginx/sites-available/pages.vps.sarvinshrivastava.space <<'EOF'
 server {
-  listen 80;
-  server_name pages.vps.sarvinshrivastava.space;
-  location / { return 404; }
+    listen 80;
+    server_name pages.vps.sarvinshrivastava.space;
+    include snippets/acme-challenge.conf;
+    location / {
+        return 301 https://$host$request_uri;
+    }
 }
 EOF
 ln -sf /etc/nginx/sites-available/pages.vps.sarvinshrivastava.space \
        /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://pages.vps.sarvinshrivastava.space/.well-known/acme-challenge/probe
 ```
 
-**Phase 2 — get the certificate, then put the real config in.**
+That must print `404`, not `301`. A `301` means the acme include is not winning
+and the certificate step will fail.
 
-`--expand` adds this name to an existing certificate rather than issuing a
-separate one. Find the lineage first — it is named after whichever hostname was
-issued first, not after this one:
+### 2. Expand the certificate — every existing name must be listed
+
+certbot reissues the lineage with **exactly** what you pass, so a name you leave
+out is a name that stops working. Get the current list first:
 
 ```bash
 certbot certificates | grep -E 'Certificate Name|Domains'
 ```
 
-Then, with `<lineage>` from that output:
+Then pass all of them plus the new one. `--webroot` writes only into
+`/var/www/certbot` and touches no nginx config, which `--nginx` does not
+guarantee — it can rewrite every vhost it thinks it owns.
 
 ```bash
-certbot --nginx --expand --cert-name <lineage> -d pages.vps.sarvinshrivastava.space
+certbot certonly --webroot -w /var/www/certbot \
+  --cert-name vps-subdomains --expand \
+  -d vps.sarvinshrivastava.space \
+  -d chat.vps.sarvinshrivastava.space \
+  -d key-distributor.vps.sarvinshrivastava.space \
+  -d monitoring.vps.sarvinshrivastava.space \
+  -d nidra-daily-push.vps.sarvinshrivastava.space \
+  -d notion-cache.vps.sarvinshrivastava.space \
+  -d otp-relay-backend.vps.sarvinshrivastava.space \
+  -d pipeline-runner.vps.sarvinshrivastava.space \
+  -d secrets.vps.sarvinshrivastava.space \
+  -d status.vps.sarvinshrivastava.space \
+  -d umami.vps.sarvinshrivastava.space \
+  -d pages.vps.sarvinshrivastava.space
 ```
 
-certbot rewrites the stub: it adds a `listen 443 ssl` block, the
-`ssl_certificate` / `ssl_certificate_key` lines, and an 80→443 redirect. Now
-replace the body of that 443 block with the configuration above — keep certbot's
-`ssl_certificate*`, `listen`, and `server_name` lines exactly as it wrote them,
-and keep the port-80 redirect server it added.
+certbot prints what it is adding and removing before it acts. **Removing must
+say `(None)`.** nginx keeps serving the old certificate until it is reloaded,
+and the old one is still valid for the others, so there is no window where
+anything breaks.
+
+### 3. The real vhost
+
+The rate-limit zone belongs in `http{}`, not the server block:
+
+```bash
+cat > /etc/nginx/conf.d/pages-ratelimit.conf <<'EOF'
+limit_req_zone $binary_remote_addr zone=pages:10m rate=10r/s;
+EOF
+```
+
+Then `/etc/nginx/sites-available/pages.vps.sarvinshrivastava.space`. Write it
+with an editor — pasting a heredoc this long into a terminal truncates and
+splices lines, and the result still parses.
+
+```nginx
+server {
+    listen 80;
+    server_name pages.vps.sarvinshrivastava.space;
+    include snippets/acme-challenge.conf;
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name pages.vps.sarvinshrivastava.space;
+
+    include snippets/ssl-vps.conf;
+
+    # The tool endpoint is NOT public. It is bearer-gated, but this container
+    # has a hard memory ceiling and one shared vCPU, and nothing outside the
+    # Docker network has any reason to reach it.
+    location = /mcp     { return 404; }
+    location ^~ /mcp/   { return 404; }
+    location = /healthz { return 404; }
+
+    # Do NOT raise this. Nothing on the public surface takes a body except the
+    # approval button; the CodePush vhost's 200m here would hand an attacker a
+    # 200 MB upload against a 384 MB container.
+    client_max_body_size 1k;
+    limit_req zone=pages burst=20 nodelay;
+
+    # The only POST on this host: pressing "Publish it" on an approval link.
+    # It deliberately has NO Content-Security-Policy of its own — see below.
+    location ^~ /approve/ {
+        limit_except GET HEAD POST { deny all; }
+        proxy_pass http://127.0.0.1:3013;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+        add_header Cache-Control "no-store, max-age=0" always;
+        add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+    }
+
+    location / {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:3013;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+
+        # A page shared today can be made private tomorrow. A cached copy would
+        # keep serving it with nothing this service can do about it.
+        proxy_cache off;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+
+        # The app sets its own CSP, nosniff, X-Frame-Options and Referrer-Policy
+        # on every response. These two are the ones it cannot guarantee from
+        # behind a proxy, and they are the ones that matter most here.
+        add_header Cache-Control "no-store, max-age=0" always;
+        add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+    }
+}
+```
 
 ```bash
 nginx -t && systemctl reload nginx
 ```
 
-**Check it before you trust it.** The first two must be 404 or the tool endpoint
-is on the public internet:
+Four things that bite, in the order they bit:
+
+- **`add_header` in a `server` block is discarded entirely if any `location`
+  also has one.** Every one of them sits inside a `location` for that reason,
+  and `always` is required or they are skipped on the 404s — which is most of
+  the security-relevant traffic here.
+- **Never move a `Content-Security-Policy` up to server level.** Two CSP headers
+  are enforced as their intersection. The app's approval page needs
+  `form-action 'self'`; a server-level `form-action 'none'` would silently kill
+  the Publish button. `^~ /approve/` matching before `location /` is what keeps
+  these apart.
+- **`systemctl reload nginx` is asynchronous.** A request fired immediately
+  after it can return nothing at all. Retry before you debug it.
+- **`grep -r` skips symlinks**, and `sites-enabled` is entirely symlinks — use
+  explicit paths.
+
+### 4. Verify before trusting it
+
+The first two are `return 404` at the nginx level, so they answer before the
+container exists:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://pages.vps.sarvinshrivastava.space/mcp
-curl -s -o /dev/null -w '%{http_code}\n' https://pages.vps.sarvinshrivastava.space/healthz
+curl -s -o /dev/null -w 'mcp     %{http_code}\n' https://pages.vps.sarvinshrivastava.space/mcp
+curl -s -o /dev/null -w 'healthz %{http_code}\n' https://pages.vps.sarvinshrivastava.space/healthz
+for h in chat secrets monitoring status umami; do
+  curl -s -o /dev/null -w "$h %{http_code}\n" "https://$h.vps.sarvinshrivastava.space/"
+done
+```
+
+`404`, `404`, and every other hostname still answering — that last loop is the
+check that the certificate expand did not break the rest of the box. A `502` on
+`/` before the deploy is correct: the vhost is proxying to a container that does
+not exist yet.
+
+After the deploy:
+
+```bash
 curl -s https://pages.vps.sarvinshrivastava.space/robots.txt
 curl -sI https://pages.vps.sarvinshrivastava.space/ | grep -i x-robots-tag
 ```
-
-Two things that will bite:
-
-- **`add_header` in a `server` block is silently discarded if any `location`
-  block also has one.** Keep every `add_header` inside `location /`, exactly as
-  above. `always` is required too, or the headers are skipped on the 404s — which
-  is most of the security-relevant traffic here.
-- **The CSP omits `script-src` entirely, so pages get no JavaScript.** That is
-  deliberate and not negotiable at this hostname: `pages.vps.…` is a sibling of
-  `secrets.vps.…`, so model-authored JS here could set cookies scoped to the
-  parent domain and read any cookie set there. If pages ever need JS, the fix is
-  a separate registrable domain, not a looser CSP.
 
 Nothing here is indexable. Every page response carries
 `X-Robots-Tag: noindex, nofollow, noarchive`, `/robots.txt` disallows everything,
