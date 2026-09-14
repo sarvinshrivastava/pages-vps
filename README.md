@@ -150,8 +150,62 @@ server {
 }
 ```
 
-Then `certbot --nginx --expand -d pages.vps.sarvinshrivastava.space` alongside the
-existing names.
+### Bringing it up — two phases, and the order matters
+
+nginx will not load a `listen 443 ssl` block before a certificate for that name
+exists, so the config above cannot be the first thing on disk. All of this runs
+**on the VPS**, as root.
+
+**Phase 1 — a port-80 stub, so certbot has something to validate against.**
+
+```bash
+cat > /etc/nginx/sites-available/pages.vps.sarvinshrivastava.space <<'EOF'
+server {
+  listen 80;
+  server_name pages.vps.sarvinshrivastava.space;
+  location / { return 404; }
+}
+EOF
+ln -sf /etc/nginx/sites-available/pages.vps.sarvinshrivastava.space \
+       /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+```
+
+**Phase 2 — get the certificate, then put the real config in.**
+
+`--expand` adds this name to an existing certificate rather than issuing a
+separate one. Find the lineage first — it is named after whichever hostname was
+issued first, not after this one:
+
+```bash
+certbot certificates | grep -E 'Certificate Name|Domains'
+```
+
+Then, with `<lineage>` from that output:
+
+```bash
+certbot --nginx --expand --cert-name <lineage> -d pages.vps.sarvinshrivastava.space
+```
+
+certbot rewrites the stub: it adds a `listen 443 ssl` block, the
+`ssl_certificate` / `ssl_certificate_key` lines, and an 80→443 redirect. Now
+replace the body of that 443 block with the configuration above — keep certbot's
+`ssl_certificate*`, `listen`, and `server_name` lines exactly as it wrote them,
+and keep the port-80 redirect server it added.
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+**Check it before you trust it.** The first two must be 404 or the tool endpoint
+is on the public internet:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://pages.vps.sarvinshrivastava.space/mcp
+curl -s -o /dev/null -w '%{http_code}\n' https://pages.vps.sarvinshrivastava.space/healthz
+curl -s https://pages.vps.sarvinshrivastava.space/robots.txt
+curl -sI https://pages.vps.sarvinshrivastava.space/ | grep -i x-robots-tag
+```
 
 Two things that will bite:
 
