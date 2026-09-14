@@ -1,7 +1,10 @@
 FROM node:22-alpine3.20 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+# --ignore-scripts: a compromised transitive dependency's postinstall would
+# otherwise run as root here, with network access and the push credential in
+# the ambient CI environment. Nothing here needs a native build.
+RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
@@ -11,7 +14,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 RUN apk add --no-cache curl
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/dist ./dist
 
 # The pages volume is written at runtime, so it must be owned by the user the

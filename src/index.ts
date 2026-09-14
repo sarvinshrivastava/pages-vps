@@ -65,8 +65,11 @@ const guard =
     }
   };
 
+// Enforced, not merely described: the previous schema documented the constraint
+// and validated nothing, so every tool but write_page accepted any string.
 const slugSchema = z
   .string()
+  .regex(/^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$/)
   .describe("Lowercase letters, digits and hyphens — this becomes the URL");
 
 function createServer(): McpServer {
@@ -86,8 +89,15 @@ function createServer(): McpServer {
     },
     guard("list_pages", async ({ filter }) => {
       const pages = await listPages();
+      const shown = filter ? pages.filter((p) => p.slug.includes(filter)) : pages;
+      // The share id IS the access control for a shared page. Returning every
+      // one of them from a tool that takes no arguments means a single injected
+      // call harvests the lot. Secret links are available per-page from
+      // share_page and rotate_share_link, which is where they belong.
       return text(
-        filter ? pages.filter((p) => p.slug.includes(filter)) : pages,
+        shown.map((p) =>
+          p.visibility === "shared" ? { ...p, url: "(shared — use share_page to get the link)" } : p,
+        ),
       );
     }),
   );
@@ -256,7 +266,10 @@ function createServer(): McpServer {
 }
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+
+// NOT app-level: mounted on the tool route only, and after the auth check, so an
+// unauthenticated caller cannot make the server parse 2 MB of JSON per request.
+const parseJson = express.json({ limit: "2mb" });
 
 app.get("/healthz", (_req, res) => {
   res.json({ status: true });
@@ -264,13 +277,17 @@ app.get("/healthz", (_req, res) => {
 
 let bearerToken = "";
 
-app.post("/mcp", async (req, res) => {
+app.post("/mcp", (req, res, next) => {
   const provided = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
   if (!bearerToken || provided !== bearerToken) {
     console.warn(`[auth] rejected request from ${req.ip ?? "unknown"}`);
     res.status(401).json({ error: "unauthorized" });
     return;
   }
+  parseJson(req, res, next);
+});
+
+app.post("/mcp", async (req, res) => {
 
   const transport = new NodeStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -304,6 +321,24 @@ app.get("/mcp", (_req, res) => {
 const pageHeaders = (res: express.Response) =>
   res
     .type("text/html; charset=utf-8")
+    // Pages are model-authored and served from a real domain whose siblings
+    // include the vault and the chat UI. `sarvinshrivastava.space` is not a
+    // public suffix, so without this a page could set a cookie scoped to
+    // `.vps.sarvinshrivastava.space` and reach every other service — session
+    // fixation against things outside this repo. Scripts are off entirely;
+    // inline styles and data: images are what a document actually needs.
+    .set(
+      "Content-Security-Policy",
+      [
+        "default-src 'none'",
+        "style-src 'unsafe-inline'",
+        "img-src data:",
+        "font-src data:",
+        "frame-ancestors 'none'",
+        "form-action 'none'",
+        "base-uri 'none'",
+      ].join("; "),
+    )
     // The pages are model-authored; never let one be framed by another origin
     // or sniffed into a different content type.
     .set("X-Content-Type-Options", "nosniff")
@@ -365,8 +400,14 @@ app.get("/", async (_req, res) => {
   // Public only. A shared page is reachable by its link, not by browsing, and a
   // private one is not on the web at all.
   const pages = (await listPages()).filter((p) => p.visibility === "public");
-  res
-    .type("text/html; charset=utf-8")
+  const escape = (s: string) =>
+    s.replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c,
+    );
+
+  // Routed through pageHeaders like every other page: this one previously
+  // shipped with no CSP, no nosniff and no frame protection at all.
+  pageHeaders(res)
     .send(
       `<!doctype html><meta charset="utf-8"><title>Pages</title>` +
         `<style>body{font:16px/1.6 system-ui;max-width:40rem;margin:3rem auto;padding:0 1rem}` +
@@ -374,7 +415,7 @@ app.get("/", async (_req, res) => {
         pages
           .map(
             (p) =>
-              `<li><a href="/${p.slug}">${p.slug}</a> <small>${new Date(p.updated).toISOString().slice(0, 10)}</small></li>`,
+              `<li><a href="/${escape(p.slug)}">${escape(p.slug)}</a> <small>${new Date(p.updated).toISOString().slice(0, 10)}</small></li>`,
           )
           .join("") +
         `</ul>`,

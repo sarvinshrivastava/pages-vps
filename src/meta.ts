@@ -41,7 +41,14 @@ export type PageMeta = {
  * "who could reach it" — which is the point of versioning the sharing state.
  */
 export const metaFile = (slug: string) => `${slug}.meta.json`;
-const metaPath = (slug: string) => path.join(config.pagesDir, metaFile(slug));
+const metaPath = (slug: string) => {
+  // Same reasoning as store.ts: the path boundary is the only place a slug check
+  // cannot be forgotten by a new caller.
+  if (!/^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$/.test(slug)) {
+    throw new Error(`Refused: "${slug}" is not a valid page name.`);
+  }
+  return path.join(config.pagesDir, metaFile(slug));
+};
 
 export async function getMeta(slug: string): Promise<PageMeta> {
   try {

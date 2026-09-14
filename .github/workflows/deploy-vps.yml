@@ -100,14 +100,21 @@ jobs:
             echo "::error::vault was unreachable while fetching VPS_HOST_KEY — refusing to fall back to trust-on-first-use"
             exit 1
           else
-            echo "::warning::VPS_HOST_KEY not in vault — falling back to trust-on-first-use. Add it to close this."
-            ssh-keyscan -H "${VPS_HOST}" >> ~/.ssh/known_hosts
+            # No TOFU fallback. If the key is absent the deploy stops rather
+            # than accepting whatever answers on port 22 and handing it a root
+            # session plus both bearer tokens.
+            echo "::error::VPS_HOST_KEY is not in the vault — refusing to deploy without a pinned host key. Add it with: ssh-keyscan -t ed25519 <host>"
+            exit 1
           fi
 
       - name: Verify the tag exists before touching the VPS
+        env:
+          # Through the environment, not interpolated into the script text —
+          # the same reasoning already applied to the deploy step below.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u "${{ github.actor }}" --password-stdin
+          echo "$GH_TOKEN" | docker login "${{ env.REGISTRY }}" -u "${{ github.actor }}" --password-stdin
           docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}" > /dev/null
 
       - name: Ship compose file
@@ -184,5 +191,5 @@ jobs:
             echo ""
             echo "Tag: \`${{ inputs.image_tag }}\`"
             echo ""
-            echo "Wire it in Open WebUI: Admin → Settings → Integrations → MCP → \`http://pages-mcp:3012/mcp\`, auth Bearer."
+            echo "Wire it in Open WebUI: Admin → Settings → Integrations → MCP → \`http://pages-mcp:3013/mcp\`, auth Bearer."
           } >> "$GITHUB_STEP_SUMMARY"

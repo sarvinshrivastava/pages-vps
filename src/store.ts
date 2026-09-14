@@ -39,7 +39,24 @@ export function isReservedSlug(slug: string): boolean {
   return RESERVED_SLUGS.has(slug);
 }
 
-const pagePath = (slug: string) => path.join(config.pagesDir, `${slug}.html`);
+/**
+ * Every filesystem path is built here, so validation belongs here rather than in
+ * a handler. It was previously only in write_page, which left read_page,
+ * share_page, delete_page and four others able to traverse: a slug of
+ * "../outside" resolved to a file outside the data directory and was read back.
+ */
+function assertSlug(slug: string): void {
+  if (!isValidSlug(slug)) {
+    throw new Error(
+      `Refused: "${slug}" is not a valid page name. Use lowercase letters, digits and hyphens, 2-64 characters.`,
+    );
+  }
+}
+
+const pagePath = (slug: string) => {
+  assertSlug(slug);
+  return path.join(config.pagesDir, `${slug}.html`);
+};
 
 export async function initRepo(): Promise<void> {
   await fs.mkdir(config.pagesDir, { recursive: true });
@@ -124,6 +141,7 @@ export async function setVisibility(
   next: PageMeta,
   message: string,
 ): Promise<{ slug: string; visibility: string; url: string | null; commit: string }> {
+  assertSlug(slug);
   await fs.access(pagePath(slug));
   await setMeta(slug, next);
   const commit = await git.commit({
@@ -146,6 +164,7 @@ export async function setVisibility(
  * when the page is shared.
  */
 export async function pageHistory(slug: string, depth: number) {
+  assertSlug(slug);
   const [content, access] = await Promise.all([
     git.log({ fs, dir: config.pagesDir, filepath: `${slug}.html`, depth }).catch(() => []),
     git.log({ fs, dir: config.pagesDir, filepath: metaFile(slug), depth }).catch(() => []),
@@ -177,6 +196,7 @@ export async function readRevision(
   slug: string,
   commit: string,
 ): Promise<string> {
+  assertSlug(slug);
   const oid = await git
     .expandOid({ fs, dir: config.pagesDir, oid: commit })
     .catch(() => commit);
