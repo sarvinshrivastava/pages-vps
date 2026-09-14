@@ -1,0 +1,76 @@
+# pages-mcp - shared HTML pages, versioned in git, created and edited from chat.
+#
+# Two surfaces on one port: /mcp for the tools (bearer-authenticated, reachable
+# only from the `shared` Docker network) and /<slug> for the rendered pages
+# (public, read-only, fronted by nginx).
+#
+#   SECRETS_MANAGER_TOKEN=<token> docker compose up -d
+
+name: pages-mcp
+
+services:
+  pages-mcp:
+    image: ${PAGES_IMAGE:-ghcr.io/sarvinshrivastava/pages-mcp:latest}
+    container_name: pages-mcp
+    restart: unless-stopped
+
+    # Loopback only. nginx terminates TLS for the public half; 3013 is free
+    # (3011 is open-webui, 3012 is bridge-mcp).
+    ports:
+      - '127.0.0.1:3013:3013'
+
+    environment:
+      PORT: '3013'
+      PAGES_DIR: '/data/pages'
+      PUBLIC_BASE: '${PUBLIC_BASE:-https://pages.vps.sarvinshrivastava.space}'
+      NODE_OPTIONS: '--max-old-space-size=128'
+
+      # Internal, so the boot path does not run through public DNS, nginx and TLS
+      # to reach a container on the same daemon.
+      SECRETS_MANAGER_URL: '${SECRETS_MANAGER_URL:-http://secret-manager:8000}'
+      SECRETS_MANAGER_FOLDER: '${SECRETS_MANAGER_FOLDER:-Root}'
+      SECRETS_MANAGER_TOKEN: '${SECRETS_MANAGER_TOKEN:?set SECRETS_MANAGER_TOKEN in the shell, or deploy via the workflow}'
+
+    volumes:
+      # The git repo of pages. This is the only durable state in the system and
+      # the one thing worth backing up.
+      - pages-data:/data
+
+    networks:
+      - shared # open-webui reaches /mcp by name
+      - vault # secret-manager, for the bearer at boot
+
+    mem_limit: 192m
+    memswap_limit: 192m
+    cpus: 0.25
+    pids_limit: 128
+
+    labels:
+      autoheal: 'true'
+    security_opt:
+      - 'no-new-privileges:true'
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:3013/healthz || exit 1']
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  pages-data:
+
+networks:
+  shared:
+    external: true
+  vault:
+    external: true
+    name: secrets-manager_default
