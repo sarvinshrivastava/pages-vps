@@ -15,6 +15,7 @@ import path from "node:path";
 import git from "isomorphic-git";
 
 import { config } from "./config.js";
+import { getMeta, setMeta, removeMeta, urlFor, metaFile, type PageMeta } from "./meta.js";
 
 const author = { name: "Open WebUI", email: "chat@vps.local" };
 
@@ -41,19 +42,20 @@ export async function listPages() {
   const pages = [];
 
   for (const entry of entries) {
-    if (!entry.endsWith(".html")) continue;
+    if (!entry.endsWith(".html") || entry.endsWith(".meta.json")) continue;
     const slug = entry.slice(0, -".html".length);
     const stat = await fs.stat(path.join(config.pagesDir, entry));
     const history = await git
       .log({ fs, dir: config.pagesDir, filepath: entry, depth: 1 })
       .catch(() => []);
 
+    const meta = await getMeta(slug);
     pages.push({
       slug,
-      url: `${config.publicBase}/${slug}`,
+      visibility: meta.visibility,
+      url: urlFor(slug, meta),
       bytes: stat.size,
       updated: stat.mtime.toISOString(),
-      revisions: history.length ? undefined : 0,
       lastMessage: history[0]?.commit.message.trim() ?? null,
     });
   }
@@ -69,9 +71,22 @@ export async function writePage(
   slug: string,
   html: string,
   message: string,
-): Promise<{ slug: string; url: string; commit: string; bytes: number }> {
+): Promise<{
+  slug: string;
+  visibility: string;
+  url: string | null;
+  commit: string;
+  bytes: number;
+}> {
   await fs.writeFile(pagePath(slug), html, "utf8");
   await git.add({ fs, dir: config.pagesDir, filepath: `${slug}.html` });
+
+  // Ensure the page has metadata before committing, so a new page is recorded as
+  // private in the same revision that creates it — never a window where content
+  // exists with no visibility decision attached.
+  const meta = await getMeta(slug);
+  await setMeta(slug, meta);
+
   const commit = await git.commit({
     fs,
     dir: config.pagesDir,
@@ -81,25 +96,59 @@ export async function writePage(
 
   return {
     slug,
-    url: `${config.publicBase}/${slug}`,
+    visibility: meta.visibility,
+    url: urlFor(slug, meta),
     commit: commit.slice(0, 8),
     bytes: Buffer.byteLength(html, "utf8"),
   };
 }
 
-export async function pageHistory(slug: string, depth: number) {
-  const log = await git.log({
+/** Change who can reach a page. Recorded as its own revision. */
+export async function setVisibility(
+  slug: string,
+  next: PageMeta,
+  message: string,
+): Promise<{ slug: string; visibility: string; url: string | null; commit: string }> {
+  await fs.access(pagePath(slug));
+  await setMeta(slug, next);
+  const commit = await git.commit({
     fs,
     dir: config.pagesDir,
-    filepath: `${slug}.html`,
-    depth,
+    message,
+    author,
   });
+  return {
+    slug,
+    visibility: next.visibility,
+    url: urlFor(slug, next),
+    commit: commit.slice(0, 8),
+  };
+}
 
-  return log.map((entry) => ({
-    commit: entry.oid.slice(0, 8),
-    message: entry.commit.message.trim(),
-    when: new Date(entry.commit.author.timestamp * 1000).toISOString(),
-  }));
+/**
+ * Revisions of both the content and who could reach it, merged into one
+ * timeline — "what did this say" and "who could see it" are the same question
+ * when the page is shared.
+ */
+export async function pageHistory(slug: string, depth: number) {
+  const [content, access] = await Promise.all([
+    git.log({ fs, dir: config.pagesDir, filepath: `${slug}.html`, depth }).catch(() => []),
+    git.log({ fs, dir: config.pagesDir, filepath: metaFile(slug), depth }).catch(() => []),
+  ]);
+
+  // Git timestamps have one-second resolution, so commits made within the same
+  // second tie and keep their concatenation order. Only visible when changes land
+  // back-to-back; real edits minutes apart sort correctly.
+  const seen = new Set<string>();
+  return [...content, ...access]
+    .filter((entry) => (seen.has(entry.oid) ? false : seen.add(entry.oid)))
+    .sort((a, b) => b.commit.author.timestamp - a.commit.author.timestamp)
+    .slice(0, depth)
+    .map((entry) => ({
+      commit: entry.oid.slice(0, 8),
+      message: entry.commit.message.trim(),
+      when: new Date(entry.commit.author.timestamp * 1000).toISOString(),
+    }));
 }
 
 /**
@@ -136,7 +185,8 @@ export async function revertPage(
   commit: string,
 ): Promise<{
   slug: string;
-  url: string;
+  visibility: string;
+  url: string | null;
   commit: string;
   restoredFrom: string;
 }> {
@@ -155,6 +205,9 @@ export async function deletePage(
 ): Promise<string> {
   await fs.unlink(pagePath(slug));
   await git.remove({ fs, dir: config.pagesDir, filepath: `${slug}.html` });
+  // Drop the visibility entry too, so a restored page comes back private rather
+  // than silently regaining a share link that was handed out before.
+  await removeMeta(slug);
   const commit = await git.commit({
     fs,
     dir: config.pagesDir,

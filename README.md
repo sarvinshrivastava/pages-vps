@@ -13,7 +13,31 @@ web. The claude.ai-artifact equivalent for a self-hosted Open WebUI.
 | `page_history` | Revisions newest-first, with ids and notes |
 | `read_revision` | A page as it was at a given revision |
 | `restore_page` | Roll back, itself recorded as a new revision |
+| `share_page` | Set visibility: private, shared or public |
+| `rotate_share_link` | Issue a new secret link and revoke the old one |
 | `delete_page` | Take a page down; history keeps it recoverable |
+
+## Visibility
+
+Three levels, because "shared" and "public" are genuinely different things:
+
+| | Reachable at | Listed | Who can open it |
+|---|---|---|---|
+| `private` | nowhere | no | only the tools — it is not on the web |
+| `shared` | `/s/<32-hex-id>` | no | anyone you send the link to |
+| `public` | `/<slug>` | yes | anyone, and it has a URL you can say aloud |
+
+**New pages are private.** Creating a page does not publish it; sharing is a
+separate, deliberate call.
+
+A shared page answers **only** at its secret link — requesting it by slug returns
+exactly the same 404 as a page that does not exist, so the slug cannot be used to
+probe what is stored. Secret links are served `no-store` and `noindex`.
+`rotate_share_link` issues a new id and the old link stops working immediately.
+
+Visibility is stored per page in `<slug>.meta.json` and committed, so
+`page_history` shows content changes **and** access changes in one timeline —
+"what did this say" and "who could reach it" answered from the same history.
 
 ## Why git
 

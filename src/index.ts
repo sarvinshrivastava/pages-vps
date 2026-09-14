@@ -17,8 +17,10 @@ import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import * as z from "zod/v4";
 
 import { config, vaultFetch } from "./config.js";
+import { getMeta, newShareId, slugForShareId, urlFor } from "./meta.js";
 import {
   initRepo,
+  setVisibility,
   isValidSlug,
   listPages,
   readPage,
@@ -103,7 +105,7 @@ function createServer(): McpServer {
     "write_page",
     {
       description:
-        "Create a page or replace its contents, recording a new revision. Pass complete HTML — a full document, styled inline. To change part of a page, read it first and send back the whole edited document.",
+        "Create a page or replace its contents, recording a new revision. Pass complete HTML — a full document, styled inline. To change part of a page, read it first and send back the whole edited document. New pages are PRIVATE until share_page is called — creating a page does not publish it.",
       inputSchema: z.object({
         slug: slugSchema,
         html: z.string().describe("The complete HTML document"),
@@ -178,6 +180,58 @@ function createServer(): McpServer {
   );
 
   server.registerTool(
+    "share_page",
+    {
+      description:
+        "Make a page reachable. 'shared' gives an unguessable link that only people you send it to can open, and which is never listed. 'public' puts it at a readable URL and lists it on the index. 'private' takes it off the web entirely — the page and its history remain, only the access changes.",
+      inputSchema: z.object({
+        slug: slugSchema,
+        visibility: z
+          .enum(["private", "shared", "public"])
+          .describe("private = tools only, shared = secret link, public = listed URL"),
+      }),
+    },
+    guard("share_page", async ({ slug, visibility }) => {
+      const current = await getMeta(slug);
+      // Keep the existing share id when re-sharing, so a link already handed out
+      // keeps working. rotate_share_link is how you deliberately revoke one.
+      const shareId =
+        visibility === "shared" ? (current.shareId ?? newShareId()) : undefined;
+      return text(
+        await setVisibility(
+          slug,
+          { visibility, ...(shareId ? { shareId } : {}) },
+          `Set ${slug} to ${visibility}`,
+        ),
+      );
+    }),
+  );
+
+  server.registerTool(
+    "rotate_share_link",
+    {
+      description:
+        "Issue a new secret link for a shared page and invalidate the old one. Use when a link reached someone it should not have.",
+      inputSchema: z.object({ slug: slugSchema }),
+    },
+    guard("rotate_share_link", async ({ slug }) => {
+      const current = await getMeta(slug);
+      if (current.visibility !== "shared") {
+        return text(
+          `Refused: ${slug} is ${current.visibility}, so it has no share link to rotate. Use share_page first.`,
+        );
+      }
+      return text(
+        await setVisibility(
+          slug,
+          { visibility: "shared", shareId: newShareId() },
+          `Rotate the share link for ${slug}`,
+        ),
+      );
+    }),
+  );
+
+  server.registerTool(
     "delete_page",
     {
       description:
@@ -229,29 +283,70 @@ app.post("/mcp", async (req, res) => {
  * listing, no traversal, and the slug pattern is validated before it ever
  * becomes a path.
  */
-app.get("/:slug", async (req, res) => {
-  const { slug } = req.params;
-  if (!isValidSlug(slug)) {
+const pageHeaders = (res: express.Response) =>
+  res
+    .type("text/html; charset=utf-8")
+    // The pages are model-authored; never let one be framed by another origin
+    // or sniffed into a different content type.
+    .set("X-Content-Type-Options", "nosniff")
+    .set("X-Frame-Options", "SAMEORIGIN")
+    .set("Referrer-Policy", "no-referrer");
+
+/**
+ * Secret-link route. The id is the credential, so it must not leak: these are
+ * marked no-store and noindex, and the 404 for a wrong id is identical to the
+ * 404 for a page that never existed.
+ */
+app.get("/s/:shareId", async (req, res) => {
+  const { shareId } = req.params;
+  if (!/^[0-9a-f]{32}$/.test(shareId)) {
+    res.status(404).type("text/plain").send("Not found");
+    return;
+  }
+  const slug = await slugForShareId(shareId);
+  if (!slug) {
     res.status(404).type("text/plain").send("Not found");
     return;
   }
   try {
     const html = await readPage(slug);
-    res
-      .type("text/html; charset=utf-8")
-      // The pages are model-authored; never let one be framed by another origin
-      // or sniffed into a different content type.
-      .set("X-Content-Type-Options", "nosniff")
-      .set("X-Frame-Options", "SAMEORIGIN")
-      .set("Referrer-Policy", "no-referrer")
+    pageHeaders(res)
+      .set("Cache-Control", "no-store")
+      .set("X-Robots-Tag", "noindex, nofollow")
       .send(html);
   } catch {
     res.status(404).type("text/plain").send("Not found");
   }
 });
 
+app.get("/:slug", async (req, res) => {
+  const { slug } = req.params;
+  if (!isValidSlug(slug)) {
+    res.status(404).type("text/plain").send("Not found");
+    return;
+  }
+
+  // Private and shared pages are NOT reachable by slug. A shared page answers
+  // only at its secret link, and the response here is identical to a page that
+  // does not exist — so the slug cannot be used to probe what is stored.
+  const meta = await getMeta(slug);
+  if (meta.visibility !== "public") {
+    res.status(404).type("text/plain").send("Not found");
+    return;
+  }
+
+  try {
+    const html = await readPage(slug);
+    pageHeaders(res).send(html);
+  } catch {
+    res.status(404).type("text/plain").send("Not found");
+  }
+});
+
 app.get("/", async (_req, res) => {
-  const pages = await listPages();
+  // Public only. A shared page is reachable by its link, not by browsing, and a
+  // private one is not on the web at all.
+  const pages = (await listPages()).filter((p) => p.visibility === "public");
   res
     .type("text/html; charset=utf-8")
     .send(
