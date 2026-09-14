@@ -231,10 +231,16 @@ jobs:
           # Six writes at once must produce six commits that are all in history.
           # Before the write queue, five of six were dangling: reported to the
           # model, absent from page_history, gone at the next gc.
+          # Collect the PIDs and wait on THOSE. A bare `wait` waits for every
+          # background job in the shell, and the stub vault above is one of them
+          # — it runs serve_forever() and never exits, so a bare wait here hangs
+          # the step until the job is cancelled. That is what burned 5h42m.
+          conc_pids=()
           for n in 1 2 3 4 5 6; do
             tool write_page "{\"slug\":\"ci-conc\",\"html\":\"<h1>$n</h1>\",\"message\":\"w$n\"}" > "/tmp/conc-$n.json" &
+            conc_pids+=($!)
           done
-          wait
+          wait "${conc_pids[@]}"
           python3 -c "
           import json, glob
           ids = set()

@@ -110,3 +110,17 @@ behaving reasonably but not the way the calling code assumed.
 - Checked and NOT a bug, having tested it: `cmd | grep -q X && fail "..."` is
   safe under `set -e`. Bash exempts every command in an AND-OR list except the
   last, so a non-matching grep does not abort the step.
+
+## A bare `wait` waits for the stub server too
+
+- The same step starts a stub vault with `&`, and the stub runs
+  `serve_forever()`. A later `wait` with no arguments waits for **every**
+  background job in the shell, that server included — so it never returns.
+- This was the actual cause of the 5h42m hang. The `grep -q` pipeline above is a
+  real hazard and worth fixing, but it was not what hung: GitHub Actions log
+  output buffers, so the last flushed line was several assertions behind where
+  execution had actually reached.
+- The lesson is the diagnostic one: **"the log stops at line N" means "the log
+  flushed up to line N", not "execution reached line N".** Do not anchor a
+  diagnosis to the last line printed.
+- Collect the PIDs you actually care about and `wait "${pids[@]}"`.
