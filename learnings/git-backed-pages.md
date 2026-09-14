@@ -90,3 +90,23 @@ behaving reasonably but not the way the calling code assumed.
   response, `/robots.txt` (what a crawler checks before fetching at all), and the
   same header from nginx (holds if the app is bypassed or replaced).
 - `noarchive` is the one people forget — it is what stops the cached copy.
+
+## `grep -q` on a streaming response hangs the pipeline forever
+
+- A CI smoke step sat for 5h42m and was killed by hand. The log stopped after the
+  last assertion that piped curl into `python3`, and never printed the next one,
+  which piped curl into `grep -q`.
+- `grep -q` exits on its first match. That collapses the pipe while `curl` is
+  still holding an open Streamable-HTTP/SSE response: curl has nothing left to
+  write, so it never sees EPIPE, and sits in `read()`. `set -o pipefail` makes
+  bash wait for every member of the pipeline, including that curl.
+- A consumer that reads to EOF (`python3 -c`, command substitution) does not do
+  this, which is why the assertion immediately before it passed.
+- Three fixes, all of them worth having: `--max-time` on every curl so a hang
+  becomes a failing assertion in seconds; `case "$out" in *word*)` against a
+  captured variable instead of piping into an early-exiting consumer; and
+  `timeout-minutes` on the step so nothing can ever consume the job's whole
+  budget again.
+- Checked and NOT a bug, having tested it: `cmd | grep -q X && fail "..."` is
+  safe under `set -e`. Bash exempts every command in an AND-OR list except the
+  last, so a non-matching grep does not abort the step.

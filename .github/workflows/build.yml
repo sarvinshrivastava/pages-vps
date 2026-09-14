@@ -71,6 +71,7 @@ jobs:
       # The image is useless if it cannot start. This catches a missing runtime
       # dependency in the same minute rather than as a crash loop on the VPS.
       - name: Smoke test — the server boots and serves health
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           # A stub vault, so boot does not depend on the real one being reachable.
@@ -106,19 +107,19 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
 
           for i in $(seq 1 20); do
-            if curl -sf http://127.0.0.1:3013/healthz > /dev/null; then echo "health ok"; break; fi
+            if curl -sf --max-time 10 http://127.0.0.1:3013/healthz > /dev/null; then echo "health ok"; break; fi
             if [ "$i" = "20" ]; then echo "never came up"; docker logs smoke; exit 1; fi
             sleep 2
           done
 
           # An unauthenticated call must be refused.
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3013/mcp \
+          code=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3013/mcp \
             -H 'Content-Type: application/json' -d '{}')
           [ "$code" = "401" ] || { echo "expected 401 without a bearer, got $code"; exit 1; }
           echo "auth gate ok"
 
           # And the tool list must actually be there.
-          tools=$(curl -s -X POST http://127.0.0.1:3013/mcp \
+          tools=$(curl -s --max-time 30 -X POST http://127.0.0.1:3013/mcp \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -H 'Authorization: Bearer ci-smoke' \
@@ -133,25 +134,27 @@ jobs:
           # suite because all of them are status codes and response headers,
           # which do not exist below the route handlers — and CI already pays for
           # a running container.
-          tool() { curl -s -X POST http://127.0.0.1:3013/mcp \
+          # --max-time on EVERY curl. A hung request must become a failing
+          # assertion in seconds, never a job that sits until it is cancelled.
+          tool() { curl -s --max-time 30 -X POST http://127.0.0.1:3013/mcp \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -H 'Authorization: Bearer ci-smoke' \
             -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" \
             | sed -n 's/^data: //p'; }
-          code() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:3013$1"; }
+          code() { curl -s --max-time 30 -o /dev/null -w '%{http_code}' "http://127.0.0.1:3013$1"; }
           fail() { echo "SMOKE FAIL: $1"; docker logs smoke; docker rm -f smoke > /dev/null; exit 1; }
 
           # A new page is PRIVATE and is not on the web.
-          tool write_page '{"slug":"ci-secret","html":"<h1>secret</h1>","message":"ci"}' \
-            | grep -q 'private' || fail "a new page was not private"
+          out=$(tool write_page '{"slug":"ci-secret","html":"<h1>secret</h1>","message":"ci"}')
+          case "$out" in *private*) ;; *) fail "a new page was not private: $out" ;; esac
           [ "$(code /ci-secret)" = "404" ] || fail "a private page was served by slug"
-          curl -s http://127.0.0.1:3013/ | grep -q ci-secret && fail "a private page was listed on the index"
+          curl -s --max-time 30 http://127.0.0.1:3013/ | grep -q ci-secret && fail "a private page was listed on the index"
 
           # The 404 for a hidden page must be byte-identical to the 404 for a
           # missing one, or the slug is an oracle for what is stored.
-          a=$(curl -s http://127.0.0.1:3013/ci-secret)
-          b=$(curl -s http://127.0.0.1:3013/ci-nonexistent)
+          a=$(curl -s --max-time 30 http://127.0.0.1:3013/ci-secret)
+          b=$(curl -s --max-time 30 http://127.0.0.1:3013/ci-nonexistent)
           [ "$a" = "$b" ] || fail "a hidden page's 404 differs from a missing page's"
 
           # Shared answers ONLY at its secret link.
@@ -159,12 +162,12 @@ jobs:
           [ -n "$id" ] || fail "share_page returned no share id"
           [ "$(code /s/$id)" = "200" ] || fail "the share link did not serve"
           [ "$(code /ci-secret)" = "404" ] || fail "A SHARED PAGE WAS SERVED BY SLUG"
-          curl -s http://127.0.0.1:3013/ | grep -q ci-secret && fail "A SHARED PAGE WAS LISTED ON THE INDEX"
+          curl -s --max-time 30 http://127.0.0.1:3013/ | grep -q ci-secret && fail "A SHARED PAGE WAS LISTED ON THE INDEX"
           [ "$(code /s/00000000000000000000000000000000)" = "404" ] || fail "a wrong share id served a page"
           [ "$(code /s/deadbeef)" = "404" ] || fail "a malformed share id was not rejected"
-          curl -sI "http://127.0.0.1:3013/s/$id" | grep -qi 'cache-control: no-store' \
+          curl -sI --max-time 30 "http://127.0.0.1:3013/s/$id" | grep -qi 'cache-control: no-store' \
             || fail "the share link is cacheable"
-          curl -sI "http://127.0.0.1:3013/s/$id" | grep -qi 'x-robots-tag: noindex' \
+          curl -sI --max-time 30 "http://127.0.0.1:3013/s/$id" | grep -qi 'x-robots-tag: noindex' \
             || fail "the share link is indexable"
 
           # REVOCATION. The single most important assertion in this file: the
@@ -185,46 +188,45 @@ jobs:
           # approval channel, so this must refuse outright and change nothing —
           # never fall back to publishing.
           tool write_page '{"slug":"ci-open","html":"<h1>open</h1>","message":"ci"}' > /dev/null
-          tool share_page '{"slug":"ci-open","visibility":"public"}' \
-            | grep -q 'Refused' || fail "share_page published without an approval channel"
+          out=$(tool share_page '{"slug":"ci-open","visibility":"public"}')
+          case "$out" in *Refused*) ;; *) fail "share_page published without an approval channel: $out" ;; esac
           [ "$(code /ci-open)" = "404" ] || fail "A PAGE WENT PUBLIC WITHOUT APPROVAL"
-          curl -s http://127.0.0.1:3013/ | grep -q ci-open && fail "an unapproved page was listed on the index"
+          curl -s --max-time 30 http://127.0.0.1:3013/ | grep -q ci-open && fail "an unapproved page was listed on the index"
 
           # An approval link that was never issued must not work.
           [ "$(code /approve/00000000000000000000000000000000)" = "404" ] || fail "an unknown approval token was accepted"
-          [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3013/approve/00000000000000000000000000000000)" = "404" ] \
+          [ "$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3013/approve/00000000000000000000000000000000)" = "404" ] \
             || fail "an unknown approval token could be spent"
 
           # Nothing on this host may be indexable, public pages included.
-          curl -s http://127.0.0.1:3013/robots.txt | grep -q 'Disallow: /' || fail "robots.txt does not disallow crawling"
+          curl -s --max-time 30 http://127.0.0.1:3013/robots.txt | grep -q 'Disallow: /' || fail "robots.txt does not disallow crawling"
           for path in / /robots.txt; do
-            curl -sI "http://127.0.0.1:3013$path" | grep -qi 'x-robots-tag: noindex' \
+            curl -sI --max-time 30 "http://127.0.0.1:3013$path" | grep -qi 'x-robots-tag: noindex' \
               || fail "$path is missing X-Robots-Tag: noindex"
           done
 
           # Reserved names cannot become pages, and GET /mcp is not a page.
           for r in mcp healthz s approve index favicon; do
-            tool write_page "{\"slug\":\"$r\",\"html\":\"<h1>x</h1>\",\"message\":\"ci\"}" \
-              | grep -q 'Refused' || fail "reserved slug '$r' was accepted"
+            out=$(tool write_page "{\"slug\":\"$r\",\"html\":\"<h1>x</h1>\",\"message\":\"ci\"}")
+            case "$out" in *Refused*) ;; *) fail "reserved slug '$r' was accepted: $out" ;; esac
           done
           [ "$(code /mcp)" = "405" ] || fail "GET /mcp is not 405"
 
           # Traversal is refused at the path boundary, on every tool — not just
           # on write_page, which is where the check used to live.
-          tool read_page '{"slug":"../../etc/hosts"}' | grep -q 'Refused' || fail "read_page accepted a traversal slug"
-          tool delete_page '{"slug":"../../tmp/evil","message":"ci"}' | grep -q 'Refused' || fail "delete_page accepted a traversal slug"
-          tool write_page '{"slug":"../../tmp/evil","html":"<h1>x</h1>","message":"ci"}' | grep -q 'Refused' || fail "write_page accepted a traversal slug"
+          case "$(tool read_page '{"slug":"../../etc/hosts"}')" in *Refused*) ;; *) fail "read_page accepted a traversal slug" ;; esac
+          case "$(tool delete_page '{"slug":"../../tmp/evil","message":"ci"}')" in *Refused*) ;; *) fail "delete_page accepted a traversal slug" ;; esac
+          case "$(tool write_page '{"slug":"../../tmp/evil","html":"<h1>x</h1>","message":"ci"}')" in *Refused*) ;; *) fail "write_page accepted a traversal slug" ;; esac
 
           # An invalid slug must come back as the refusal sentence, NOT as a
           # protocol error carrying a schema dump the model cannot act on.
-          tool read_page '{"slug":"NOT A SLUG"}' | grep -q 'Refused' || fail "an invalid slug was not refused in words"
+          case "$(tool read_page '{"slug":"NOT A SLUG"}')" in *Refused*) ;; *) fail "an invalid slug was not refused in words" ;; esac
 
           # A deleted page must still be walkable, or delete_page's promise that
           # restore_page can bring it back is false.
           tool write_page '{"slug":"ci-doomed","html":"<h1>v1</h1>","message":"v1"}' > /dev/null
           tool delete_page '{"slug":"ci-doomed","message":"ci"}' > /dev/null
-          tool page_history '{"slug":"ci-doomed","depth":20}' | grep -q 'commit' \
-            || fail "the history of a deleted page is empty — restore_page cannot reach it"
+          case "$(tool page_history '{"slug":"ci-doomed","depth":20}')" in *commit*) ;; *) fail "the history of a deleted page is empty — restore_page cannot reach it" ;; esac
 
           # Six writes at once must produce six commits that are all in history.
           # Before the write queue, five of six were dangling: reported to the
@@ -250,7 +252,7 @@ jobs:
 
           # The health check must read the disk, not assert from memory: the page
           # count is the volume-loss canary.
-          curl -s http://127.0.0.1:3013/healthz | grep -q '"pages"' \
+          curl -s --max-time 30 http://127.0.0.1:3013/healthz | grep -q '"pages"' \
             || fail "/healthz does not report a page count"
 
           echo "visibility matrix ok"
