@@ -22,6 +22,7 @@ import {
   initRepo,
   setVisibility,
   isValidSlug,
+  isReservedSlug,
   listPages,
   readPage,
   writePage,
@@ -115,6 +116,11 @@ function createServer(): McpServer {
       }),
     },
     guard("write_page", async ({ slug, html, message }) => {
+      if (isReservedSlug(slug)) {
+        return text(
+          `Refused: "${slug}" is reserved — it is a route on this server, so a page cannot take that name.`,
+        );
+      }
       if (!isValidSlug(slug)) {
         return text(
           `Refused: "${slug}" is not a valid slug. Use lowercase letters, digits and hyphens, 2-64 characters, starting and ending alphanumeric.`,
@@ -283,6 +289,18 @@ app.post("/mcp", async (req, res) => {
  * listing, no traversal, and the slug pattern is validated before it ever
  * becomes a path.
  */
+/**
+ * Registered BEFORE /:slug so a page can never shadow the tool endpoint. Returns
+ * 405 rather than falling through, which is also what an MCP client expects from
+ * a GET on a stateless server.
+ */
+app.get("/mcp", (_req, res) => {
+  res.status(405).json({
+    error: "method not allowed",
+    detail: "This endpoint speaks MCP over POST.",
+  });
+});
+
 const pageHeaders = (res: express.Response) =>
   res
     .type("text/html; charset=utf-8")

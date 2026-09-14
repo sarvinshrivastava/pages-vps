@@ -19,9 +19,24 @@ import { getMeta, setMeta, removeMeta, urlFor, metaFile, type PageMeta } from ".
 
 const author = { name: "Open WebUI", email: "chat@vps.local" };
 
+/**
+ * Names that must never become pages, because they are routes on this server.
+ *
+ * Without this a page called "mcp" is served at GET /mcp — the tool endpoint's
+ * own path — which is model-authored HTML on a URL people are told to trust.
+ * POST /mcp still reaches the real handler, so this is confusion and a phishing
+ * surface rather than a compromise, but it should simply not be possible.
+ */
+const RESERVED_SLUGS = new Set(["mcp", "healthz", "s", "index", "favicon"]);
+
 /** Slugs become filenames and URL paths, so they are tightly constrained. */
 export function isValidSlug(slug: string): boolean {
+  if (RESERVED_SLUGS.has(slug)) return false;
   return /^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$/.test(slug);
+}
+
+export function isReservedSlug(slug: string): boolean {
+  return RESERVED_SLUGS.has(slug);
 }
 
 const pagePath = (slug: string) => path.join(config.pagesDir, `${slug}.html`);
