@@ -76,7 +76,37 @@ const pagePath = (slug: string) => {
   return path.join(config.pagesDir, `${slug}.html`);
 };
 
+/**
+ * Refuses to start on a volume that did not attach.
+ *
+ * The Dockerfile creates /data/pages in the IMAGE, because that is what gives
+ * the volume `node` ownership on first mount — which means a missing volume is
+ * indistinguishable from a first boot. initRepo would see an empty directory,
+ * git.init a fresh history over the top, and report healthy, with every page
+ * gone. Silently initialising an empty history is the least recoverable thing
+ * this service does, so it checks the mount table rather than the directory.
+ */
+async function assertVolumeMounted(): Promise<void> {
+  if (!config.requireMount) return;
+  const mountinfo = await fs
+    .readFile("/proc/self/mountinfo", "utf8")
+    .catch(() => "");
+  // Field 5 is the mount point. An empty read means no procfs, which is not
+  // the container this check exists for.
+  if (!mountinfo) return;
+  const target = path.dirname(config.pagesDir);
+  const mounted = mountinfo
+    .split("\n")
+    .some((line) => line.split(" ")[4] === target);
+  if (!mounted) {
+    throw new Error(
+      `FATAL: ${target} is not a mount point — the pages volume did not attach. Refusing to start a new, empty history over it.`,
+    );
+  }
+}
+
 export async function initRepo(): Promise<void> {
+  await assertVolumeMounted();
   await fs.mkdir(config.pagesDir, { recursive: true });
   const gitdir = path.join(config.pagesDir, ".git");
   try {
@@ -85,6 +115,32 @@ export async function initRepo(): Promise<void> {
     await git.init({ fs, dir: config.pagesDir, defaultBranch: "main" });
     console.log(`[store] initialised a new page repo at ${config.pagesDir}`);
   }
+}
+
+/**
+ * What /healthz asks the disk, rather than asserting from memory.
+ *
+ * The page count is the volume-loss canary: it dropping to zero is the signal
+ * you want, and a plain {status:true} cannot give it. The probe write catches a
+ * read-only remount, a full disk, and a restore done with the wrong ownership —
+ * none of which the old health check could see.
+ */
+export async function storeHealth(): Promise<{
+  pages: number;
+  head: string;
+}> {
+  const head = (
+    await fs.readFile(path.join(config.pagesDir, ".git/HEAD"), "utf8")
+  ).trim();
+  // Not named *.html, so listPages ignores it; and git.commit commits the index
+  // rather than the worktree, so it can never land in a revision.
+  const probe = path.join(config.pagesDir, ".healthz");
+  await fs.writeFile(probe, String(Date.now()));
+  await fs.unlink(probe);
+  const pages = (await fs.readdir(config.pagesDir)).filter((f) =>
+    f.endsWith(".html"),
+  ).length;
+  return { pages, head };
 }
 
 export async function listPages() {

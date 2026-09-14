@@ -24,6 +24,7 @@ import {
   isValidSlug,
   isReservedSlug,
   listPages,
+  storeHealth,
   readPage,
   writePage,
   pageHistory,
@@ -302,8 +303,16 @@ const app = express();
 // refusal in write_page is the one that should fire.
 const parseJson = express.json({ limit: "4mb" });
 
-app.get("/healthz", (_req, res) => {
-  res.json({ status: true });
+app.get("/healthz", async (_req, res) => {
+  try {
+    res.json({ status: true, ...(await storeHealth()), token: Boolean(bearerToken) });
+  } catch (error) {
+    // 503 so the Docker healthcheck fails and autoheal restarts it. A health
+    // check that cannot fail is a liveness probe wearing a readiness probe's
+    // clothes: a volume remounted read-only, a full disk, or a .git corrupted
+    // by an OOM kill mid-commit all used to report perfectly healthy.
+    res.status(503).json({ status: false, error: String(error) });
+  }
 });
 
 let bearerToken = "";

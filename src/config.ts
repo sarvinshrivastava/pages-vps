@@ -20,6 +20,12 @@ export const config = {
   /** Where the git repo of pages lives. A docker volume, so it survives deploys. */
   pagesDir: env("PAGES_DIR", "/data/pages"),
 
+  /**
+   * Refuse to boot if PAGES_DIR's parent is not a mount point. On by default —
+   * turn it off only for a local run outside a container.
+   */
+  requireMount: (process.env.REQUIRE_MOUNT ?? "1") !== "0",
+
   /** Used to build the shareable URL returned to the model. */
   publicBase: env("PUBLIC_BASE", "https://pages.vps.sarvinshrivastava.space"),
 

@@ -87,10 +87,21 @@ jobs:
           " &
           sleep 1
 
+          # The production sandbox, not a bare `docker run`: read-only rootfs,
+          # dropped capabilities and the real memory ceiling. Without these flags
+          # a regression in any of them ships green and only fails on the VPS —
+          # and the memory ceiling in particular is a number worth discovering
+          # here rather than as an OOM kill mid-commit on the only copy of every
+          # page. REQUIRE_MOUNT=0 because /tmp/pages is a tmpfs, not a volume.
           docker run -d --name smoke --network host \
+            --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 384m --memory-swap 512m \
             -e SECRETS_MANAGER_URL=http://127.0.0.1:8890 \
             -e SECRETS_MANAGER_TOKEN=ci \
             -e PAGES_DIR=/tmp/pages \
+            -e REQUIRE_MOUNT=0 \
+            -e PUBLIC_BASE=http://127.0.0.1:3013 \
             -e PORT=3013 \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
 
@@ -116,6 +127,118 @@ jobs:
           [ "$tools" -eq 9 ] || { echo "expected exactly 9 tools, got $tools"; exit 1; }
           echo "tools/list ok — $tools tools"
 
+          # ---- the visibility matrix ----
+          # Every assertion below is about a page reaching someone it should not,
+          # or a page becoming unrecoverable. They run here rather than in a unit
+          # suite because all of them are status codes and response headers,
+          # which do not exist below the route handlers — and CI already pays for
+          # a running container.
+          tool() { curl -s -X POST http://127.0.0.1:3013/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'Authorization: Bearer ci-smoke' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" \
+            | sed -n 's/^data: //p'; }
+          code() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:3013$1"; }
+          fail() { echo "SMOKE FAIL: $1"; docker logs smoke; docker rm -f smoke > /dev/null; exit 1; }
+
+          # A new page is PRIVATE and is not on the web.
+          tool write_page '{"slug":"ci-secret","html":"<h1>secret</h1>","message":"ci"}' \
+            | grep -q 'private' || fail "a new page was not private"
+          [ "$(code /ci-secret)" = "404" ] || fail "a private page was served by slug"
+          curl -s http://127.0.0.1:3013/ | grep -q ci-secret && fail "a private page was listed on the index"
+
+          # The 404 for a hidden page must be byte-identical to the 404 for a
+          # missing one, or the slug is an oracle for what is stored.
+          a=$(curl -s http://127.0.0.1:3013/ci-secret)
+          b=$(curl -s http://127.0.0.1:3013/ci-nonexistent)
+          [ "$a" = "$b" ] || fail "a hidden page's 404 differs from a missing page's"
+
+          # Shared answers ONLY at its secret link.
+          id=$(tool share_page '{"slug":"ci-secret","visibility":"shared"}' | grep -o '[0-9a-f]\{32\}' | head -1)
+          [ -n "$id" ] || fail "share_page returned no share id"
+          [ "$(code /s/$id)" = "200" ] || fail "the share link did not serve"
+          [ "$(code /ci-secret)" = "404" ] || fail "A SHARED PAGE WAS SERVED BY SLUG"
+          curl -s http://127.0.0.1:3013/ | grep -q ci-secret && fail "A SHARED PAGE WAS LISTED ON THE INDEX"
+          [ "$(code /s/00000000000000000000000000000000)" = "404" ] || fail "a wrong share id served a page"
+          [ "$(code /s/deadbeef)" = "404" ] || fail "a malformed share id was not rejected"
+          curl -sI "http://127.0.0.1:3013/s/$id" | grep -qi 'cache-control: no-store' \
+            || fail "the share link is cacheable"
+          curl -sI "http://127.0.0.1:3013/s/$id" | grep -qi 'x-robots-tag: noindex' \
+            || fail "the share link is indexable"
+
+          # REVOCATION. The single most important assertion in this file: the
+          # share id is dropped from the metadata when a page goes private, and a
+          # refactor that "preserves" it brings every link ever handed out back
+          # to life, silently.
+          tool share_page '{"slug":"ci-secret","visibility":"private"}' > /dev/null
+          [ "$(code /s/$id)" = "404" ] || fail "A REVOKED SHARE LINK STILL SERVES"
+
+          # Rotation invalidates the old link.
+          id2=$(tool share_page '{"slug":"ci-secret","visibility":"shared"}' | grep -o '[0-9a-f]\{32\}' | head -1)
+          id3=$(tool rotate_share_link '{"slug":"ci-secret"}' | grep -o '[0-9a-f]\{32\}' | head -1)
+          [ "$id2" != "$id3" ] || fail "rotate_share_link did not change the id"
+          [ "$(code /s/$id2)" = "404" ] || fail "A ROTATED-AWAY SHARE LINK STILL SERVES"
+          [ "$(code /s/$id3)" = "200" ] || fail "the rotated share link does not serve"
+
+          # Public is reachable and listed.
+          tool write_page '{"slug":"ci-open","html":"<h1>open</h1>","message":"ci"}' > /dev/null
+          tool share_page '{"slug":"ci-open","visibility":"public"}' > /dev/null
+          [ "$(code /ci-open)" = "200" ] || fail "a public page was not served"
+          curl -s http://127.0.0.1:3013/ | grep -q ci-open || fail "a public page was not listed"
+
+          # Reserved names cannot become pages, and GET /mcp is not a page.
+          for r in mcp healthz s index favicon; do
+            tool write_page "{\"slug\":\"$r\",\"html\":\"<h1>x</h1>\",\"message\":\"ci\"}" \
+              | grep -q 'Refused' || fail "reserved slug '$r' was accepted"
+          done
+          [ "$(code /mcp)" = "405" ] || fail "GET /mcp is not 405"
+
+          # Traversal is refused at the path boundary, on every tool — not just
+          # on write_page, which is where the check used to live.
+          tool read_page '{"slug":"../../etc/hosts"}' | grep -q 'Refused' || fail "read_page accepted a traversal slug"
+          tool delete_page '{"slug":"../../tmp/evil","message":"ci"}' | grep -q 'Refused' || fail "delete_page accepted a traversal slug"
+          tool write_page '{"slug":"../../tmp/evil","html":"<h1>x</h1>","message":"ci"}' | grep -q 'Refused' || fail "write_page accepted a traversal slug"
+
+          # An invalid slug must come back as the refusal sentence, NOT as a
+          # protocol error carrying a schema dump the model cannot act on.
+          tool read_page '{"slug":"NOT A SLUG"}' | grep -q 'Refused' || fail "an invalid slug was not refused in words"
+
+          # A deleted page must still be walkable, or delete_page's promise that
+          # restore_page can bring it back is false.
+          tool write_page '{"slug":"ci-doomed","html":"<h1>v1</h1>","message":"v1"}' > /dev/null
+          tool delete_page '{"slug":"ci-doomed","message":"ci"}' > /dev/null
+          tool page_history '{"slug":"ci-doomed","depth":20}' | grep -q 'commit' \
+            || fail "the history of a deleted page is empty — restore_page cannot reach it"
+
+          # Six writes at once must produce six commits that are all in history.
+          # Before the write queue, five of six were dangling: reported to the
+          # model, absent from page_history, gone at the next gc.
+          for n in 1 2 3 4 5 6; do
+            tool write_page "{\"slug\":\"ci-conc\",\"html\":\"<h1>$n</h1>\",\"message\":\"w$n\"}" > "/tmp/conc-$n.json" &
+          done
+          wait
+          python3 -c "
+          import json, glob
+          ids = set()
+          for f in glob.glob('/tmp/conc-*.json'):
+              r = json.load(open(f))
+              ids.add(json.loads(r['result']['content'][0]['text'])['commit'])
+          assert len(ids) == 6, f'expected 6 distinct commits, got {len(ids)}'
+          print('concurrent writes reported', len(ids), 'commits')
+          " || fail "concurrent write_page did not report six commits"
+          n=$(tool page_history '{"slug":"ci-conc","depth":20}' | python3 -c "
+          import sys, json
+          print(len(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])))
+          ")
+          [ "$n" -ge 6 ] || fail "only $n of 6 concurrent commits are in history — writes were discarded"
+
+          # The health check must read the disk, not assert from memory: the page
+          # count is the volume-loss canary.
+          curl -s http://127.0.0.1:3013/healthz | grep -q '"pages"' \
+            || fail "/healthz does not report a page count"
+
+          echo "visibility matrix ok"
           docker rm -f smoke > /dev/null
 
       - name: Report
