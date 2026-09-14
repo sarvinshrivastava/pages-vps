@@ -65,3 +65,28 @@ behaving reasonably but not the way the calling code assumed.
   `npm ci` still installs from it, with no subresource-integrity check at all.
 - Regenerate from `package.json` alone, in an empty directory, and keep only the
   lockfile the image is actually built from.
+
+## A confirmation the model can satisfy is not a confirmation
+
+- `confirm: true` as a tool argument, or a token returned to the model to send
+  back, are both satisfiable inside one turn. A document carrying injected
+  instructions satisfies them just as easily as a person would.
+- The gate has to be a channel the model cannot reach. Here: a push notification
+  carrying a one-time link, with the token never returned to the model.
+- Which makes one integration rule load-bearing — if this service is ever added
+  to bridge-mcp's `SERVICE_REGISTRY`, it must be `methods: ["GET"]` with
+  `^/approve/` denied. A POST reachable from chat lets the model approve its own
+  request and the gate is worth nothing.
+- Fail closed: no channel configured means `public` is refused, never published
+  without approval. Pending requests are in memory so a restart drops them.
+
+## "Public" and "indexable" are different decisions
+
+- A share link had `X-Robots-Tag: noindex` and a public page had nothing, which
+  quietly made publishing an irreversible act: the URL and a cached copy stay in
+  the index long after the page is taken down, and the service cannot purge
+  either.
+- Three layers, because each covers a different bypass: the header on every
+  response, `/robots.txt` (what a crawler checks before fetching at all), and the
+  same header from nginx (holds if the app is bypassed or replaced).
+- `noarchive` is the one people forget — it is what stops the cached copy.

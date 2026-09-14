@@ -17,6 +17,7 @@ import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import * as z from "zod/v4";
 
 import { config, vaultFetch } from "./config.js";
+import { consume, peek, requestPublication } from "./approvals.js";
 import { getMeta, newShareId, slugForShareId, urlFor } from "./meta.js";
 import {
   initRepo,
@@ -228,7 +229,7 @@ function createServer(): McpServer {
     "share_page",
     {
       description:
-        "Make a page reachable. 'shared' gives an unguessable link that only people you send it to can open, and which is never listed. 'public' puts it at a readable URL and lists it on the index. 'private' takes it off the web entirely — the page and its history remain, only the access changes.",
+        "Make a page reachable. 'shared' gives an unguessable link that only people you send it to can open, and which is never listed — this is the right choice for sharing something with a person, and it takes effect immediately. 'private' takes it off the web entirely. 'public' puts it at a readable URL on the index and CANNOT be done from chat: it sends the owner a notification to approve, and the page does not change until they do. No page is ever indexed by search engines.",
       inputSchema: z.object({
         slug: slugSchema,
         visibility: z
@@ -238,6 +239,19 @@ function createServer(): McpServer {
     },
     guard("share_page", async ({ slug, visibility }) => {
       const current = await getMeta(slug);
+
+      // Public is the one irreversible direction. Everything else this service
+      // does can be undone; a page that has been on a public URL may already
+      // have been fetched, and nothing here can recall that. So the model can
+      // ask, and only the owner can do it.
+      if (visibility === "public" && current.visibility !== "public") {
+        await readPage(slug); // 404s here rather than after the notification
+        await requestPublication(slug);
+        return text(
+          `Sent to the owner for approval. "${slug}" is still ${current.visibility} and will not change unless they approve it, which expires in 15 minutes. If you need a link right now, use visibility "shared" — that works immediately and is not listed anywhere.`,
+        );
+      }
+
       // Keep the existing share id when re-sharing, so a link already handed out
       // keeps working. rotate_share_link is how you deliberately revoke one.
       const shareId =
@@ -360,6 +374,27 @@ app.get("/mcp", (_req, res) => {
   });
 });
 
+/**
+ * Belt to the X-Robots-Tag braces. A header only reaches a crawler that fetched
+ * the page; this one tells it not to fetch at all, and it is the file most
+ * crawlers actually check first.
+ */
+const escapeHtml = (value: string) =>
+  value.replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ] ?? c,
+  );
+
+app.get("/robots.txt", (_req, res) => {
+  res
+    .type("text/plain")
+    .set("X-Robots-Tag", "noindex, nofollow, noarchive")
+    .send("User-agent: *\nDisallow: /\n");
+});
+
 const pageHeaders = (res: express.Response) =>
   res
     .type("text/html; charset=utf-8")
@@ -385,7 +420,13 @@ const pageHeaders = (res: express.Response) =>
     // or sniffed into a different content type.
     .set("X-Content-Type-Options", "nosniff")
     .set("X-Frame-Options", "SAMEORIGIN")
-    .set("Referrer-Policy", "no-referrer");
+    .set("Referrer-Policy", "no-referrer")
+    // On EVERY page, including public ones and the index. "Public" here means
+    // "anyone with the link can open it", not "findable". A page that gets
+    // indexed outlives any later decision to take it down: the URL stays in the
+    // index and the cache, and this service has no way to purge either.
+    // noarchive covers the cached-copy half specifically.
+    .set("X-Robots-Tag", "noindex, nofollow, noarchive");
 
 /**
  * Secret-link route. The id is the credential, so it must not leak: these are
@@ -405,12 +446,125 @@ app.get("/s/:shareId", async (req, res) => {
   }
   try {
     const html = await readPage(slug);
-    pageHeaders(res)
-      .set("Cache-Control", "no-store")
-      .set("X-Robots-Tag", "noindex, nofollow")
-      .send(html);
+    pageHeaders(res).set("Cache-Control", "no-store").send(html);
   } catch {
     res.status(404).type("text/plain").send("Not found");
+  }
+});
+
+/**
+ * The approval surface. Unauthenticated by necessity — it is opened from a phone
+ * notification — so the token in the path IS the credential, exactly like a
+ * share id: 16 random bytes, single use, 15 minutes.
+ *
+ * Its own CSP, because this is the one page on this host that has a form. Pages
+ * get form-action 'none'; this needs 'self' and nothing more.
+ */
+const approvalHeaders = (res: express.Response) =>
+  res
+    .type("text/html; charset=utf-8")
+    .set(
+      "Content-Security-Policy",
+      [
+        "default-src 'none'",
+        "style-src 'unsafe-inline'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+      ].join("; "),
+    )
+    .set("X-Content-Type-Options", "nosniff")
+    .set("X-Frame-Options", "DENY")
+    .set("Referrer-Policy", "no-referrer")
+    .set("Cache-Control", "no-store")
+    .set("X-Robots-Tag", "noindex, nofollow, noarchive");
+
+const approvalPage = (body: string) =>
+  `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+  `<title>Approve publishing</title>` +
+  `<style>body{font:16px/1.6 system-ui;max-width:34rem;margin:3rem auto;padding:0 1.25rem}` +
+  `h1{font-size:1.35rem;margin:0 0 1rem}dl{display:grid;grid-template-columns:auto 1fr;gap:.35rem 1rem;margin:1.5rem 0}` +
+  `dt{color:#555}dd{margin:0;font-variant-numeric:tabular-nums}` +
+  `button{font:inherit;padding:.7rem 1.4rem;border:0;border-radius:.4rem;background:#0e7c86;color:#fff}` +
+  `p.note{color:#555;font-size:.9rem}</style>${body}`;
+
+app.get("/approve/:token", async (req, res) => {
+  const request = peek(req.params.token);
+  if (!request) {
+    approvalHeaders(res)
+      .status(404)
+      .send(
+        approvalPage(
+          `<h1>Nothing to approve</h1><p>This request has already been used, or it expired. Ask again in chat.</p>`,
+        ),
+      );
+    return;
+  }
+
+  const meta = await getMeta(request.slug);
+  let bytes = 0;
+  try {
+    bytes = Buffer.byteLength(await readPage(request.slug), "utf8");
+  } catch {
+    approvalHeaders(res)
+      .status(404)
+      .send(
+        approvalPage(
+          `<h1>Nothing to approve</h1><p>The page <code>${escapeHtml(request.slug)}</code> no longer exists.</p>`,
+        ),
+      );
+    return;
+  }
+
+  approvalHeaders(res).send(
+    approvalPage(
+      `<h1>Publish this page?</h1>` +
+        `<p>Chat asked to put it at a public URL. Read it first — it is model-authored.</p>` +
+        `<dl><dt>Page</dt><dd><code>${escapeHtml(request.slug)}</code></dd>` +
+        `<dt>Now</dt><dd>${escapeHtml(meta.visibility)}</dd>` +
+        `<dt>Size</dt><dd>${bytes.toLocaleString("en-US")} bytes</dd>` +
+        `<dt>Will be</dt><dd><code>${escapeHtml(config.publicBase)}/${escapeHtml(request.slug)}</code></dd></dl>` +
+        `<form method="POST"><button type="submit">Publish it</button></form>` +
+        `<p class="note">Doing nothing leaves the page exactly as it is. The link works once and expires 15 minutes after it was sent.</p>`,
+    ),
+  );
+});
+
+app.post("/approve/:token", async (req, res) => {
+  const request = consume(req.params.token);
+  if (!request) {
+    approvalHeaders(res)
+      .status(404)
+      .send(
+        approvalPage(
+          `<h1>Nothing to approve</h1><p>This request has already been used, or it expired.</p>`,
+        ),
+      );
+    return;
+  }
+
+  try {
+    const current = await getMeta(request.slug);
+    const result = await setVisibility(
+      request.slug,
+      { visibility: "public" },
+      `Publish ${request.slug} (approved from ${req.ip ?? "unknown"}, was ${current.visibility})`,
+    );
+    console.log(`[approve] ${request.slug} published at ${result.commit}`);
+    approvalHeaders(res).send(
+      approvalPage(
+        `<h1>Published</h1><p><code>${escapeHtml(config.publicBase)}/${escapeHtml(request.slug)}</code> is live.</p>` +
+          `<p class="note">It is not indexed by search engines. To take it down, ask chat to make it private.</p>`,
+      ),
+    );
+  } catch (error) {
+    approvalHeaders(res)
+      .status(500)
+      .send(
+        approvalPage(
+          `<h1>Could not publish</h1><p>${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`,
+        ),
+      );
   }
 });
 
@@ -442,11 +596,6 @@ app.get("/", async (_req, res) => {
   // Public only. A shared page is reachable by its link, not by browsing, and a
   // private one is not on the web at all.
   const pages = (await listPages()).filter((p) => p.visibility === "public");
-  const escape = (s: string) =>
-    s.replace(/[&<>"']/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c,
-    );
-
   // Routed through pageHeaders like every other page: this one previously
   // shipped with no CSP, no nosniff and no frame protection at all.
   pageHeaders(res)
@@ -457,7 +606,7 @@ app.get("/", async (_req, res) => {
         pages
           .map(
             (p) =>
-              `<li><a href="/${escape(p.slug)}">${escape(p.slug)}</a> <small>${new Date(p.updated).toISOString().slice(0, 10)}</small></li>`,
+              `<li><a href="/${escapeHtml(p.slug)}">${escapeHtml(p.slug)}</a> <small>${new Date(p.updated).toISOString().slice(0, 10)}</small></li>`,
           )
           .join("") +
         `</ul>`,
@@ -467,6 +616,33 @@ app.get("/", async (_req, res) => {
 async function main() {
   await initRepo();
   bearerToken = await vaultFetch("PAGES_MCP_TOKEN");
+
+  // Optional. Absent means share_page refuses "public" outright rather than
+  // silently publishing without a human — which is the failure mode worth
+  // having. A secret link still works.
+  const channel = await vaultFetch("PAGES_NTFY_URL").catch((error: unknown) => {
+    console.warn(
+      `[approve] no approval channel configured, so pages cannot be made public: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return "";
+  });
+  // Validate here rather than at the moment someone tries to publish. A
+  // mistyped value would otherwise surface as "Failed to parse URL from ..."
+  // inside a refusal message weeks later, which reads like a bug in the tool.
+  if (channel) {
+    try {
+      const parsed = new URL(channel);
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        throw new Error(`unsupported scheme ${parsed.protocol}`);
+      }
+      config.approvals.notifyUrl = channel;
+      console.log(`[approve] approval channel: ${parsed.origin}${parsed.pathname}`);
+    } catch (error) {
+      console.warn(
+        `[approve] PAGES_NTFY_URL is not a usable URL (${error instanceof Error ? error.message : String(error)}) — pages cannot be made public until it is fixed.`,
+      );
+    }
+  }
   app.listen(config.port, "0.0.0.0", () => {
     console.log(`pages-mcp listening on :${config.port}`);
     console.log(`serving ${config.publicBase}`);

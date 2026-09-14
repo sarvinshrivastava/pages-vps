@@ -95,14 +95,25 @@ server {
   location ^~ /mcp/   { return 404; }
   location = /healthz { return 404; }
 
-  # 2. The public surface is GET-only and nothing here accepts a body. Do NOT
+  # 2. Almost everything here is GET-only and nothing accepts a body. Do NOT
   #    inherit `client_max_body_size 200m` from the CodePush vhost — that hands
   #    an attacker a 200 MB upload against a 384 MB container.
   client_max_body_size 1k;
-  limit_except GET HEAD { deny all; }
   limit_req zone=pages burst=20 nodelay;
 
+  # The one exception: pressing "Publish it" on an approval link is a POST.
+  location ^~ /approve/ {
+    proxy_pass http://127.0.0.1:3013;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    limit_except GET HEAD POST { deny all; }
+    add_header Cache-Control "no-store, max-age=0" always;
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+  }
+
   location / {
+    limit_except GET HEAD { deny all; }
     proxy_pass http://127.0.0.1:3013;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -122,6 +133,10 @@ server {
     proxy_hide_header Referrer-Policy;
 
     add_header Cache-Control "no-store, max-age=0" always;
+    # Belt and braces with the app's own header and /robots.txt. Nothing on this
+    # host is meant to be findable in a search engine — "public" means anyone
+    # with the link can open it, not that it can be found.
+    add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy no-referrer always;
     add_header X-Frame-Options DENY always;
@@ -150,9 +165,38 @@ Two things that will bite:
   parent domain and read any cookie set there. If pages ever need JS, the fix is
   a separate registrable domain, not a looser CSP.
 
-One consequence worth knowing rather than fixing: public pages are indexable, on
-purpose. Making one private later does not remove it from Google's index or
-cache — that needs a removal request.
+Nothing here is indexable. Every page response carries
+`X-Robots-Tag: noindex, nofollow, noarchive`, `/robots.txt` disallows everything,
+and the vhost repeats the header so it holds even if the app is bypassed. A page
+that got indexed would outlive any later decision to take it down — the URL stays
+in the index and the cache, and this service cannot purge either.
+
+## Publishing needs a human
+
+`share_page` can set `private` and `shared` on its own. It **cannot** set
+`public`. That asks instead: the service pushes a notification to
+`PAGES_NTFY_URL` with a one-time link, and the page does not change until
+someone opens that link and presses the button.
+
+The approval token is never returned to the model. That is the whole point — a
+`confirm: true` argument, or a token handed back to be echoed, is something the
+model can satisfy in the same turn, and a document carrying injected
+instructions would satisfy it just as easily. The token exists only in the push
+notification, is single-use, and expires after 15 minutes. Pending requests live
+in memory, so a restart drops them, which fails closed.
+
+If `PAGES_NTFY_URL` is absent or unparseable, `public` is refused outright and
+the reason says so. It never falls back to publishing.
+
+Set it to a full ntfy topic URL, e.g. `https://ntfy.sh/<something-unguessable>`.
+**The topic name is the credential** — anyone who knows it can read your
+approval requests, so do not reuse the VPS alerts topic and do not pick
+something guessable.
+
+One thing to keep true: if `pages-mcp` is ever added to bridge-mcp's
+`SERVICE_REGISTRY`, give it `methods: ["GET"]` and deny `^/approve/`. A POST
+reachable from chat would let the model approve its own request, and the gate
+would be worth nothing.
 
 ## Running it
 

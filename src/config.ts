@@ -29,6 +29,15 @@ export const config = {
   /** Used to build the shareable URL returned to the model. */
   publicBase: env("PUBLIC_BASE", "https://pages.vps.sarvinshrivastava.space"),
 
+  approvals: {
+    /**
+     * Where the "approve publishing this page" push goes. An ntfy topic URL.
+     * Filled from the vault at boot; empty means public pages cannot be created
+     * at all, which is the correct failure: no channel, no approval, no publish.
+     */
+    notifyUrl: "",
+  },
+
   vault: {
     url: env("SECRETS_MANAGER_URL", "http://secret-manager:8000"),
     folder: env("SECRETS_MANAGER_FOLDER", "Root"),

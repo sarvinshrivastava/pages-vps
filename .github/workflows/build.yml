@@ -181,14 +181,29 @@ jobs:
           [ "$(code /s/$id2)" = "404" ] || fail "A ROTATED-AWAY SHARE LINK STILL SERVES"
           [ "$(code /s/$id3)" = "200" ] || fail "the rotated share link does not serve"
 
-          # Public is reachable and listed.
+          # PUBLISHING IS NOT THE MODEL'S TO DO. The smoke vault has no usable
+          # approval channel, so this must refuse outright and change nothing —
+          # never fall back to publishing.
           tool write_page '{"slug":"ci-open","html":"<h1>open</h1>","message":"ci"}' > /dev/null
-          tool share_page '{"slug":"ci-open","visibility":"public"}' > /dev/null
-          [ "$(code /ci-open)" = "200" ] || fail "a public page was not served"
-          curl -s http://127.0.0.1:3013/ | grep -q ci-open || fail "a public page was not listed"
+          tool share_page '{"slug":"ci-open","visibility":"public"}' \
+            | grep -q 'Refused' || fail "share_page published without an approval channel"
+          [ "$(code /ci-open)" = "404" ] || fail "A PAGE WENT PUBLIC WITHOUT APPROVAL"
+          curl -s http://127.0.0.1:3013/ | grep -q ci-open && fail "an unapproved page was listed on the index"
+
+          # An approval link that was never issued must not work.
+          [ "$(code /approve/00000000000000000000000000000000)" = "404" ] || fail "an unknown approval token was accepted"
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3013/approve/00000000000000000000000000000000)" = "404" ] \
+            || fail "an unknown approval token could be spent"
+
+          # Nothing on this host may be indexable, public pages included.
+          curl -s http://127.0.0.1:3013/robots.txt | grep -q 'Disallow: /' || fail "robots.txt does not disallow crawling"
+          for path in / /robots.txt; do
+            curl -sI "http://127.0.0.1:3013$path" | grep -qi 'x-robots-tag: noindex' \
+              || fail "$path is missing X-Robots-Tag: noindex"
+          done
 
           # Reserved names cannot become pages, and GET /mcp is not a page.
-          for r in mcp healthz s index favicon; do
+          for r in mcp healthz s approve index favicon; do
             tool write_page "{\"slug\":\"$r\",\"html\":\"<h1>x</h1>\",\"message\":\"ci\"}" \
               | grep -q 'Refused' || fail "reserved slug '$r' was accepted"
           done

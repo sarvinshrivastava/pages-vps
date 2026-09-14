@@ -45,7 +45,15 @@ function serialise<T>(fn: () => Promise<T>): Promise<T> {
  * POST /mcp still reaches the real handler, so this is confusion and a phishing
  * surface rather than a compromise, but it should simply not be possible.
  */
-const RESERVED_SLUGS = new Set(["mcp", "healthz", "s", "index", "favicon"]);
+const RESERVED_SLUGS = new Set([
+  "mcp",
+  "healthz",
+  "s",
+  "approve",
+  "robots.txt",
+  "index",
+  "favicon",
+]);
 
 /** Slugs become filenames and URL paths, so they are tightly constrained. */
 export function isValidSlug(slug: string): boolean {
