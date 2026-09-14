@@ -124,3 +124,18 @@ behaving reasonably but not the way the calling code assumed.
   flushed up to line N", not "execution reached line N".** Do not anchor a
   diagnosis to the last line printed.
 - Collect the PIDs you actually care about and `wait "${pids[@]}"`.
+
+## `x=$(a | b)` under `set -e` + `pipefail` swallows its own error message
+
+- `id=$(tool share_page ... | grep -o '[0-9a-f]\{32\}' | head -1)` followed by
+  `[ -n "$id" ] || fail "share_page returned no share id"` never prints that
+  message. If `grep -o` matches nothing it exits 1, `pipefail` propagates it to
+  the assignment, and `set -e` kills the step *before* the check below it runs.
+- `head -1` closes the pipe as soon as it has a line, which can also hand the
+  upstream stage exit 141 on SIGPIPE — the same abort, on a passing case.
+- So the assertion that was written to explain the failure is exactly the one
+  that cannot run. End every such assignment with `|| true` and let the explicit
+  check do the reporting.
+- This is a diagnosability bug, not a correctness one: the verdict is right, the
+  message is missing. Which is worse than it sounds when the feedback loop is a
+  CI run.

@@ -124,7 +124,7 @@ jobs:
             -H 'Accept: application/json, text/event-stream' \
             -H 'Authorization: Bearer ci-smoke' \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-            | sed -n 's/^data: //p' | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))")
+            | sed -n 's/^data: //p' | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))") || true
           [ "$tools" -eq 9 ] || { echo "expected exactly 9 tools, got $tools"; exit 1; }
           echo "tools/list ok — $tools tools"
 
@@ -144,6 +144,10 @@ jobs:
             | sed -n 's/^data: //p'; }
           code() { curl -s --max-time 30 -o /dev/null -w '%{http_code}' "http://127.0.0.1:3013$1"; }
           fail() { echo "SMOKE FAIL: $1"; docker logs smoke; docker rm -f smoke > /dev/null; exit 1; }
+          # Every `x=$(a | b)` below ends in `|| true` on purpose. Under
+          # set -e + pipefail the assignment itself aborts the step the instant
+          # any stage fails — before the `|| fail "..."` written to explain it
+          # can run — so a broken assertion reports nothing at all.
 
           # A new page is PRIVATE and is not on the web.
           out=$(tool write_page '{"slug":"ci-secret","html":"<h1>secret</h1>","message":"ci"}')
@@ -158,7 +162,7 @@ jobs:
           [ "$a" = "$b" ] || fail "a hidden page's 404 differs from a missing page's"
 
           # Shared answers ONLY at its secret link.
-          id=$(tool share_page '{"slug":"ci-secret","visibility":"shared"}' | grep -o '[0-9a-f]\{32\}' | head -1)
+          id=$(tool share_page '{"slug":"ci-secret","visibility":"shared"}' | grep -o '[0-9a-f]\{32\}' | head -1) || true
           [ -n "$id" ] || fail "share_page returned no share id"
           [ "$(code /s/$id)" = "200" ] || fail "the share link did not serve"
           [ "$(code /ci-secret)" = "404" ] || fail "A SHARED PAGE WAS SERVED BY SLUG"
@@ -178,8 +182,8 @@ jobs:
           [ "$(code /s/$id)" = "404" ] || fail "A REVOKED SHARE LINK STILL SERVES"
 
           # Rotation invalidates the old link.
-          id2=$(tool share_page '{"slug":"ci-secret","visibility":"shared"}' | grep -o '[0-9a-f]\{32\}' | head -1)
-          id3=$(tool rotate_share_link '{"slug":"ci-secret"}' | grep -o '[0-9a-f]\{32\}' | head -1)
+          id2=$(tool share_page '{"slug":"ci-secret","visibility":"shared"}' | grep -o '[0-9a-f]\{32\}' | head -1) || true
+          id3=$(tool rotate_share_link '{"slug":"ci-secret"}' | grep -o '[0-9a-f]\{32\}' | head -1) || true
           [ "$id2" != "$id3" ] || fail "rotate_share_link did not change the id"
           [ "$(code /s/$id2)" = "404" ] || fail "A ROTATED-AWAY SHARE LINK STILL SERVES"
           [ "$(code /s/$id3)" = "200" ] || fail "the rotated share link does not serve"
@@ -253,7 +257,7 @@ jobs:
           n=$(tool page_history '{"slug":"ci-conc","depth":20}' | python3 -c "
           import sys, json
           print(len(json.loads(json.load(sys.stdin)['result']['content'][0]['text'])))
-          ")
+          ") || true
           [ "$n" -ge 6 ] || fail "only $n of 6 concurrent commits are in history — writes were discarded"
 
           # The health check must read the disk, not assert from memory: the page
