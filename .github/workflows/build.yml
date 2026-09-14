@@ -113,7 +113,7 @@ jobs:
             -H 'Authorization: Bearer ci-smoke' \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
             | sed -n 's/^data: //p' | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))")
-          [ "$tools" -ge 7 ] || { echo "expected at least 7 tools, got $tools"; exit 1; }
+          [ "$tools" -eq 9 ] || { echo "expected exactly 9 tools, got $tools"; exit 1; }
           echo "tools/list ok — $tools tools"
 
           docker rm -f smoke > /dev/null

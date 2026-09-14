@@ -1,8 +1,12 @@
 # pages-mcp - shared HTML pages, versioned in git, created and edited from chat.
 #
-# Two surfaces on one port: /mcp for the tools (bearer-authenticated, reachable
-# only from the `shared` Docker network) and /<slug> for the rendered pages
-# (public, read-only, fronted by nginx).
+# Two surfaces on one port: /mcp for the tools (bearer-authenticated) and
+# /<slug> for the rendered pages (public, read-only, fronted by nginx).
+#
+# The port is published on 127.0.0.1 as well as the `shared` network, so nginx
+# can proxy the pages — which means the vhost MUST return 404 for /mcp and
+# /healthz. A default `location / { proxy_pass ... }` puts the tool endpoint on
+# the public internet. See README.
 #
 #   SECRETS_MANAGER_TOKEN=<token> docker compose up -d
 
@@ -23,7 +27,10 @@ services:
       PORT: '3013'
       PAGES_DIR: '/data/pages'
       PUBLIC_BASE: '${PUBLIC_BASE:-https://pages.vps.sarvinshrivastava.space}'
-      NODE_OPTIONS: '--max-old-space-size=128'
+      # Caps V8's old space only. isomorphic-git allocates its inflate output
+      # and blob reads as EXTERNAL buffers, which this does not bound - measured
+      # 190 MB RSS at 20 pages / 200 commits with the cap set to 128.
+      NODE_OPTIONS: '--max-old-space-size=256'
 
       # Internal, so the boot path does not run through public DNS, nginx and TLS
       # to reach a container on the same daemon.
@@ -40,9 +47,15 @@ services:
       - shared # open-webui reaches /mcp by name
       - vault # secret-manager, for the bearer at boot
 
-    mem_limit: 192m
-    memswap_limit: 192m
-    cpus: 0.25
+    # 192m was measured at 189.5 MB RSS after 20 pages / 200 commits - a trivial
+    # scale, one list_pages from the cgroup OOM-killer. The kill is not a clean
+    # restart: it lands mid-git.commit, which is a non-atomic index write ->
+    # loose objects -> ref update, and the only copy of every page is in there.
+    mem_limit: 384m
+    memswap_limit: 512m # NOT equal to mem_limit: that disables swap entirely
+    # A hard quota only guarantees this service is slow when the box is idle.
+    # It serves a handful of requests a day and is otherwise asleep.
+    cpus: 1.0
     pids_limit: 128
 
     labels:

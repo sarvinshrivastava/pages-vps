@@ -30,6 +30,17 @@ export type PageMeta = {
   visibility: Visibility;
   /** Present only while the page is shared; rotating it revokes old links. */
   shareId?: string;
+  /**
+   * The last change note, cached here rather than read from git.
+   *
+   * list_pages used to call git.log(filepath) per page. depth bounds the RESULT
+   * count, not the walk: with a filepath isomorphic-git pushes a commit only when
+   * that file's oid changes, so it reads and inflates every commit back to the
+   * page's last edit. A page untouched for 2000 commits cost a 2000-commit walk,
+   * synchronously, on every listing — measured at 33 ms per page at 200 commits
+   * and rising linearly, with the event loop blocked throughout.
+   */
+  lastMessage?: string;
 };
 
 /**

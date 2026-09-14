@@ -56,21 +56,49 @@ const guard =
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.startsWith("Refused:")) return text(message);
-      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+
+      // isomorphic-git's own errors are caller mistakes, not faults: a stale or
+      // mistyped commit id is the likeliest error in read_revision and
+      // restore_page, and surfacing it as isError makes the model read a Python
+      // repr instead of the sentence.
+      const code = (error as { code?: unknown })?.code;
+      if (
+        code === "NotFoundError" ||
+        code === "AmbiguousError" ||
+        code === "ObjectTypeError"
+      ) {
+        return text(
+          `Refused: ${message} Use page_history to see the revisions that exist.`,
+        );
+      }
+
+      // Deliberately NOT a blanket ENOENT check: that reported a detached volume
+      // or a missing git object as "no page with that slug", so a real
+      // filesystem failure looked like a user mistake and never reached a log.
+      // Only a missing page FILE means what the message says.
+      if (
+        (error as NodeJS.ErrnoException)?.code === "ENOENT" &&
+        String((error as NodeJS.ErrnoException).path ?? "").endsWith(".html")
+      ) {
         return text(
           `Refused: no page with that slug. Use list_pages to see what exists.`,
         );
       }
+
       return text(`Failed: ${message}`, true);
     }
   };
 
-// Enforced, not merely described: the previous schema documented the constraint
-// and validated nothing, so every tool but write_page accepted any string.
+// Described here, ENFORCED in assertSlug at the filesystem path boundary.
+// Deliberately not a .regex(): the SDK validates the schema before the handler
+// runs, so a bad slug became an isError protocol failure carrying a Zod dump,
+// and the hand-written "Refused: ... use lowercase letters, digits and hyphens"
+// sentence — the one the model can actually act on — became unreachable.
 const slugSchema = z
   .string()
-  .regex(/^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$/)
-  .describe("Lowercase letters, digits and hyphens — this becomes the URL");
+  .describe(
+    "Lowercase letters, digits and hyphens, 2-64 characters — this becomes the URL",
+  );
 
 function createServer(): McpServer {
   const server = new McpServer({ name: "pages", version: "0.1.0" });
@@ -269,7 +297,10 @@ const app = express();
 
 // NOT app-level: mounted on the tool route only, and after the auth check, so an
 // unauthenticated caller cannot make the server parse 2 MB of JSON per request.
-const parseJson = express.json({ limit: "2mb" });
+// 4mb, not the 512 KB page limit: heavy \u escaping inflates a legal page past
+// 2 MB, and an express 413 is not a sentence the model can act on. The page-size
+// refusal in write_page is the one that should fire.
+const parseJson = express.json({ limit: "4mb" });
 
 app.get("/healthz", (_req, res) => {
   res.json({ status: true });
@@ -294,8 +325,10 @@ app.post("/mcp", async (req, res) => {
   });
   const server = createServer();
   res.on("close", () => {
-    void transport.close?.();
-    void server.close?.();
+    // Catch, not `void`: Node 22 throws on unhandled rejections, so a rejecting
+    // close() would kill the process and autoheal would mask the cause.
+    transport.close().catch(() => {});
+    server.close().catch(() => {});
   });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);

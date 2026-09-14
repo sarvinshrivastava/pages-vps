@@ -20,6 +20,24 @@ import { getMeta, setMeta, removeMeta, urlFor, metaFile, type PageMeta } from ".
 const author = { name: "Open WebUI", email: "chat@vps.local" };
 
 /**
+ * Serialises every write. `git.add` + `git.commit` share one on-disk index and
+ * one HEAD, so concurrent writes each report a commit id while all but the last
+ * are left dangling — reachable by id today, gone after the next gc, and absent
+ * from page_history all along. Open WebUI runs one turn's tools sequentially, so
+ * this needs two chats at once; that is a normal state for a shared instance.
+ */
+let writeQueue: Promise<unknown> = Promise.resolve();
+function serialise<T>(fn: () => Promise<T>): Promise<T> {
+  const run = writeQueue.then(fn, fn);
+  // Keep the chain alive regardless of outcome; callers see their own rejection.
+  writeQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/**
  * Names that must never become pages, because they are routes on this server.
  *
  * Without this a page called "mcp" is served at GET /mcp — the tool endpoint's
@@ -74,13 +92,13 @@ export async function listPages() {
   const pages = [];
 
   for (const entry of entries) {
-    if (!entry.endsWith(".html") || entry.endsWith(".meta.json")) continue;
+    // A .meta.json never ends in .html, so the extension test alone is enough.
+    if (!entry.endsWith(".html")) continue;
     const slug = entry.slice(0, -".html".length);
+    // Names come from the filesystem here, not from the validator, so a file
+    // placed by hand or restored from a backup could carry anything.
+    if (!isValidSlug(slug)) continue;
     const stat = await fs.stat(path.join(config.pagesDir, entry));
-    const history = await git
-      .log({ fs, dir: config.pagesDir, filepath: entry, depth: 1 })
-      .catch(() => []);
-
     const meta = await getMeta(slug);
     pages.push({
       slug,
@@ -88,7 +106,7 @@ export async function listPages() {
       url: urlFor(slug, meta),
       bytes: stat.size,
       updated: stat.mtime.toISOString(),
-      lastMessage: history[0]?.commit.message.trim() ?? null,
+      lastMessage: meta.lastMessage ?? null,
     });
   }
 
@@ -110,19 +128,21 @@ export async function writePage(
   commit: string;
   bytes: number;
 }> {
+  return serialise(async () => {
   await fs.writeFile(pagePath(slug), html, "utf8");
   await git.add({ fs, dir: config.pagesDir, filepath: `${slug}.html` });
 
   // Ensure the page has metadata before committing, so a new page is recorded as
   // private in the same revision that creates it — never a window where content
   // exists with no visibility decision attached.
-  const meta = await getMeta(slug);
+  const note = message || `Update ${slug}`;
+  const meta = { ...(await getMeta(slug)), lastMessage: note };
   await setMeta(slug, meta);
 
   const commit = await git.commit({
     fs,
     dir: config.pagesDir,
-    message: message || `Update ${slug}`,
+    message: note,
     author,
   });
 
@@ -133,6 +153,7 @@ export async function writePage(
     commit: commit.slice(0, 8),
     bytes: Buffer.byteLength(html, "utf8"),
   };
+  });
 }
 
 /** Change who can reach a page. Recorded as its own revision. */
@@ -142,8 +163,12 @@ export async function setVisibility(
   message: string,
 ): Promise<{ slug: string; visibility: string; url: string | null; commit: string }> {
   assertSlug(slug);
+  return serialise(async () => {
   await fs.access(pagePath(slug));
-  await setMeta(slug, next);
+  // next is built from scratch by the caller (dropping shareId is how a page is
+  // unshared), so the cached note has to be carried across explicitly.
+  const carried = { lastMessage: (await getMeta(slug)).lastMessage, ...next };
+  await setMeta(slug, carried);
   const commit = await git.commit({
     fs,
     dir: config.pagesDir,
@@ -152,10 +177,11 @@ export async function setVisibility(
   });
   return {
     slug,
-    visibility: next.visibility,
-    url: urlFor(slug, next),
+    visibility: carried.visibility,
+    url: urlFor(slug, carried),
     commit: commit.slice(0, 8),
   };
+  });
 }
 
 /**
@@ -166,17 +192,31 @@ export async function setVisibility(
 export async function pageHistory(slug: string, depth: number) {
   assertSlug(slug);
   const [content, access] = await Promise.all([
-    git.log({ fs, dir: config.pagesDir, filepath: `${slug}.html`, depth }).catch(() => []),
-    git.log({ fs, dir: config.pagesDir, filepath: metaFile(slug), depth }).catch(() => []),
+    // force: true is what makes a DELETED page's history readable. Without it
+    // git.log throws NotFoundError when the path is absent from HEAD's tree, the
+    // catch swallowed it, and page_history returned [] - so delete_page's
+    // promise that "restore_page can bring it back" was unwalkable.
+    git.log({ fs, dir: config.pagesDir, filepath: `${slug}.html`, depth, force: true }).catch(() => []),
+    git.log({ fs, dir: config.pagesDir, filepath: metaFile(slug), depth, force: true }).catch(() => []),
   ]);
 
-  // Git timestamps have one-second resolution, so commits made within the same
-  // second tie and keep their concatenation order. Only visible when changes land
-  // back-to-back; real edits minutes apart sort correctly.
+  // Order by git's own walk, NOT by timestamp. Timestamps are second-resolution,
+  // so a create followed by a share - the common case within one model turn -
+  // ties, and a stable sort then leaves the older commit first in a list
+  // documented newest-first. The walk is authoritative on a linear history.
+  const walk = await git
+    .log({ fs, dir: config.pagesDir, depth: depth * 4 })
+    .catch(() => []);
+  const rank = new Map(walk.map((c, i) => [c.oid, i]));
+
   const seen = new Set<string>();
   return [...content, ...access]
     .filter((entry) => (seen.has(entry.oid) ? false : seen.add(entry.oid)))
-    .sort((a, b) => b.commit.author.timestamp - a.commit.author.timestamp)
+    .sort(
+      (a, b) =>
+        (rank.get(a.oid) ?? Number.MAX_SAFE_INTEGER) -
+        (rank.get(b.oid) ?? Number.MAX_SAFE_INTEGER),
+    )
     .slice(0, depth)
     .map((entry) => ({
       commit: entry.oid.slice(0, 8),
@@ -197,9 +237,21 @@ export async function readRevision(
   commit: string,
 ): Promise<string> {
   assertSlug(slug);
-  const oid = await git
-    .expandOid({ fs, dir: config.pagesDir, oid: commit })
-    .catch(() => commit);
+  // Let expandOid throw: swallowing AmbiguousError turned "that prefix matches
+  // several commits" into "could not find it", which is the wrong diagnosis.
+  const oid = await git.expandOid({ fs, dir: config.pagesDir, oid: commit });
+
+  // Every commit carries a whole tree, so reading a blob at this path would
+  // succeed for a commit that never touched THIS page. Require the commit to be
+  // one of the page's own revisions.
+  const own = await git
+    .log({ fs, dir: config.pagesDir, filepath: `${slug}.html`, force: true })
+    .catch(() => []);
+  if (!own.some((entry) => entry.oid === oid)) {
+    throw new Error(
+      `Refused: ${commit} is not a revision of "${slug}". Use page_history to list its revisions.`,
+    );
+  }
 
   const { blob } = await git.readBlob({
     fs,
@@ -238,6 +290,7 @@ export async function deletePage(
   slug: string,
   message: string,
 ): Promise<string> {
+  return serialise(async () => {
   await fs.unlink(pagePath(slug));
   await git.remove({ fs, dir: config.pagesDir, filepath: `${slug}.html` });
   // Drop the visibility entry too, so a restored page comes back private rather
@@ -252,4 +305,5 @@ export async function deletePage(
   // The file is gone from the working tree but every revision remains in the
   // history, so a delete is recoverable with restore_page.
   return commit.slice(0, 8);
+  });
 }
